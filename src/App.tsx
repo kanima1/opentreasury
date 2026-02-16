@@ -13,11 +13,11 @@ type LabelType = "Donation" | "Grant" | "Ops" | "Milestone" | "Other";
 
 type TxMeta = {
   label: LabelType;
-  note?: string; // used as "Description" (and also stores Other detail via "Other: ...")
-  proofUrl?: string; // "Supporting Link"
+  note?: string; // Description (and stores Other detail via "Other: ...")
+  proofUrl?: string; // Supporting Link
 };
 
-type Tab = "Dashboard" | "Classified Transactions";
+type Tab = "Dashboard" | "Treasury Ledger";
 
 const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111"; // placeholder (valid address)
 
@@ -68,6 +68,10 @@ function parseOtherDetail(note?: string) {
 }
 
 export default function App() {
+  // Public view detection (?view=public)
+  const searchParams = new URLSearchParams(window.location.search);
+  const isPublicView = searchParams.get("view") === "public";
+
   const [tab, setTab] = useState<Tab>("Dashboard");
 
   const [treasury, setTreasury] = useState<string>(DEFAULT_TREASURY);
@@ -80,22 +84,22 @@ export default function App() {
   const [selectedSig, setSelectedSig] = useState<string | null>(null);
 
   const [editLabel, setEditLabel] = useState<LabelType>("Donation");
-  const [editOtherDetail, setEditOtherDetail] = useState<string>(""); // only used when label = Other
-  const [editNote, setEditNote] = useState<string>(""); // "Description"
-  const [editProof, setEditProof] = useState<string>(""); // "Supporting Link"
+  const [editOtherDetail, setEditOtherDetail] = useState<string>(""); // only when label=Other
+  const [editNote, setEditNote] = useState<string>(""); // Description
+  const [editProof, setEditProof] = useState<string>(""); // Supporting Link
   const [saveMsg, setSaveMsg] = useState<string>("");
 
-  const [searchSaved, setSearchSaved] = useState<string>("");
+  const [searchLedger, setSearchLedger] = useState<string>("");
 
   const editorRef = useRef<HTMLDivElement | null>(null);
 
-  // Devnet for now (safe + free). We'll add mainnet toggle later.
+  // Devnet for now
   const connection = useMemo(
     () => new Connection("https://api.devnet.solana.com", "confirmed"),
     []
   );
 
-  // Load saved classifications for current treasury
+  // Load saved labels (local)
   useEffect(() => {
     try {
       const raw = localStorage.getItem(storageKey(treasury));
@@ -105,10 +109,10 @@ export default function App() {
     }
     setSelectedSig(null);
     setSaveMsg("");
-    setSearchSaved("");
+    setSearchLedger("");
   }, [treasury]);
 
-  // Fetch balance + tx list
+  // Fetch balance + txs
   useEffect(() => {
     let cancelled = false;
 
@@ -132,14 +136,15 @@ export default function App() {
         );
         if (cancelled) return;
 
-        const rows: TxRow[] = sigs.map((s) => ({
-          signature: s.signature,
-          slot: s.slot,
-          blockTime: s.blockTime,
-          err: s.err ? JSON.stringify(s.err) : null,
-        }));
+        setTxs(
+          sigs.map((s) => ({
+            signature: s.signature,
+            slot: s.slot,
+            blockTime: s.blockTime,
+            err: s.err ? JSON.stringify(s.err) : null,
+          }))
+        );
 
-        setTxs(rows);
         setStatus("Loaded ✅");
       } catch (e: any) {
         setStatus("");
@@ -153,7 +158,7 @@ export default function App() {
     };
   }, [treasury, connection]);
 
-  // When selecting a tx, populate editor fields with saved values
+  // Populate editor when tx is selected
   useEffect(() => {
     if (!selectedSig) return;
 
@@ -164,7 +169,7 @@ export default function App() {
 
       if (saved.label === "Other") {
         setEditOtherDetail(parseOtherDetail(saved.note));
-        // If note includes extra info like "Other: X | Y", keep Y as Description
+        // If note looks like "Other: X | Y", keep Y as Description
         const parts = (saved.note ?? "").split("|").map((p) => p.trim());
         if (parts.length >= 2) setEditNote(parts.slice(1).join(" | "));
         else setEditNote("");
@@ -182,7 +187,7 @@ export default function App() {
     setSaveMsg("");
   }, [selectedSig, meta]);
 
-  // If user changes label away from Other, clear Other detail
+  // If label changes away from Other, clear the custom name field
   useEffect(() => {
     if (editLabel !== "Other") setEditOtherDetail("");
   }, [editLabel]);
@@ -192,6 +197,8 @@ export default function App() {
   }
 
   function selectTx(sig: string, opts?: { goEditor?: boolean }) {
+    if (isPublicView) return; // public view is read-only
+
     setSelectedSig(sig);
     if (opts?.goEditor) {
       setTimeout(() => {
@@ -202,7 +209,7 @@ export default function App() {
   }
 
   function saveMeta() {
-    if (!selectedSig) return;
+    if (!selectedSig || isPublicView) return;
 
     const trimmedProof = editProof.trim();
     if (trimmedProof && !isValidHttpUrl(trimmedProof)) {
@@ -213,10 +220,9 @@ export default function App() {
     const desc = editNote.trim();
     const other = editOtherDetail.trim();
 
-    let finalNote: string | undefined = undefined;
+    let finalNote: string | undefined;
 
     if (editLabel === "Other") {
-      // Store as: "Other: <custom>" + optionally " | <description>"
       const base = other ? `Other: ${other}` : "Other";
       finalNote = desc ? `${base} | ${desc}` : other ? base : undefined;
     } else {
@@ -238,7 +244,8 @@ export default function App() {
   }
 
   function clearMeta() {
-    if (!selectedSig) return;
+    if (!selectedSig || isPublicView) return;
+
     const next = { ...meta };
     delete next[selectedSig];
     setMeta(next);
@@ -246,10 +253,10 @@ export default function App() {
     setSaveMsg("Removed ✅");
   }
 
-  const labeledCount = Object.keys(meta).length;
+  const ledgerEntries = Object.keys(meta).length;
 
-  const savedEntries = Object.entries(meta).filter(([sig, m]) => {
-    const q = searchSaved.trim().toLowerCase();
+  const ledgerRows = Object.entries(meta).filter(([sig, m]) => {
+    const q = searchLedger.trim().toLowerCase();
     if (!q) return true;
     return (
       sig.toLowerCase().includes(q) ||
@@ -258,6 +265,13 @@ export default function App() {
       (m.proofUrl ?? "").toLowerCase().includes(q)
     );
   });
+
+  function copyPublicLink() {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "public");
+    navigator.clipboard.writeText(url.toString());
+    alert("Public view link copied ✅");
+  }
 
   return (
     <div
@@ -268,15 +282,35 @@ export default function App() {
         fontFamily: "system-ui",
       }}
     >
-      <h1 style={{ marginBottom: 4 }}>OpenTreasury (MVP)</h1>
+      <h1 style={{ marginBottom: 4 }}>
+        OpenTreasury (MVP){isPublicView ? " — Public View" : ""}
+      </h1>
       <p style={{ marginTop: 0, opacity: 0.8 }}>
-        Treasury transparency dashboard (devnet). Classifications are stored locally in your browser.
+        Treasury transparency dashboard (devnet).{" "}
+        {isPublicView
+          ? "Read-only view for sharing."
+          : "Annotations are stored locally in your browser."}
       </p>
 
       {/* Top Controls */}
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end", marginTop: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          flexWrap: "wrap",
+          alignItems: "end",
+          marginTop: 16,
+        }}
+      >
         <div style={{ flex: 1, minWidth: 320 }}>
-          <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+          <label
+            style={{
+              display: "block",
+              fontSize: 12,
+              opacity: 0.75,
+              marginBottom: 6,
+            }}
+          >
             Treasury Wallet Address
           </label>
           <input
@@ -306,9 +340,29 @@ export default function App() {
         </div>
 
         <div style={{ minWidth: 180 }}>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>Classified Transactions</div>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{labeledCount}</div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>Ledger Entries</div>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>{ledgerEntries}</div>
         </div>
+
+        {!isPublicView && (
+          <div style={{ minWidth: 220 }}>
+            <button
+              onClick={copyPublicLink}
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 12,
+                border: "1px solid rgba(0,0,0,0.15)",
+                background: "#111",
+                color: "white",
+                fontWeight: 900,
+                cursor: "pointer",
+              }}
+            >
+              Copy Public View Link
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Tabs */}
@@ -328,18 +382,18 @@ export default function App() {
           Dashboard
         </button>
         <button
-          onClick={() => setTab("Classified Transactions")}
+          onClick={() => setTab("Treasury Ledger")}
           style={{
             padding: "10px 12px",
             borderRadius: 12,
             border: "1px solid rgba(0,0,0,0.15)",
-            background: tab === "Classified Transactions" ? "#111" : "rgba(0,0,0,0.06)",
-            color: tab === "Classified Transactions" ? "white" : "black",
+            background: tab === "Treasury Ledger" ? "#111" : "rgba(0,0,0,0.06)",
+            color: tab === "Treasury Ledger" ? "white" : "black",
             fontWeight: 900,
             cursor: "pointer",
           }}
         >
-          Classified Transactions ({labeledCount})
+          Treasury Ledger ({ledgerEntries})
         </button>
       </div>
 
@@ -362,20 +416,33 @@ export default function App() {
 
       {/* Dashboard Tab */}
       {tab === "Dashboard" && (
-        <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: 14, marginTop: 20 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1.5fr 1fr",
+            gap: 14,
+            marginTop: 20,
+          }}
+        >
           <div>
             <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
-              Recent Transactions (select to classify)
+              Recent Transactions {isPublicView ? "" : "(select to annotate)"}
             </h2>
 
-            <div style={{ overflowX: "auto", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12 }}>
+            <div
+              style={{
+                overflowX: "auto",
+                border: "1px solid rgba(0,0,0,0.12)",
+                borderRadius: 12,
+              }}
+            >
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead style={{ background: "rgba(0,0,0,0.03)" }}>
                   <tr>
                     <th style={{ textAlign: "left", padding: 10 }}>Signature</th>
                     <th style={{ textAlign: "left", padding: 10 }}>Time</th>
                     <th style={{ textAlign: "left", padding: 10 }}>Category</th>
-                    <th style={{ textAlign: "left", padding: 10 }}>Error</th>
+                    <th style={{ textAlign: "left", padding: 10 }}>Status</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -389,15 +456,17 @@ export default function App() {
                     txs.map((t) => {
                       const isSelected = selectedSig === t.signature;
                       const label = meta[t.signature]?.label ?? "—";
+
                       return (
                         <tr
                           key={t.signature}
                           onClick={() => {
+                            if (isPublicView) return;
                             setSelectedSig(t.signature);
                             setTimeout(scrollToEditor, 50);
                           }}
                           style={{
-                            cursor: "pointer",
+                            cursor: isPublicView ? "default" : "pointer",
                             borderTop: "1px solid rgba(0,0,0,0.08)",
                             background: isSelected ? "rgba(0,0,0,0.04)" : "transparent",
                           }}
@@ -418,7 +487,13 @@ export default function App() {
                           <td style={{ padding: 10, fontWeight: 900, color: labelColor(label) }}>
                             {label}
                           </td>
-                          <td style={{ padding: 10 }}>{t.err ?? "—"}</td>
+                          <td style={{ padding: 10 }}>
+                            {t.err ? (
+                              <span style={{ color: "#dc2626", fontWeight: 800 }}>Failed</span>
+                            ) : (
+                              <span style={{ color: "#16a34a", fontWeight: 800 }}>Confirmed</span>
+                            )}
+                          </td>
                         </tr>
                       );
                     })
@@ -428,156 +503,158 @@ export default function App() {
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-              Tip: Use “Classified Transactions” to search and revisit any classification.
+              Tip: The ledger tab is your searchable index of annotated transactions.
             </div>
           </div>
 
-          {/* Classification editor */}
-          <div ref={editorRef}>
-            <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
-              Transaction Classification
-            </h2>
+          {/* Editor (hidden in Public View) */}
+          {!isPublicView && (
+            <div ref={editorRef}>
+              <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
+                Transaction Annotation
+              </h2>
 
-            <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
-              {!selectedSig ? (
-                <div style={{ opacity: 0.75, fontSize: 13 }}>
-                  Select a transaction to classify and document its purpose.
-                </div>
-              ) : (
-                <>
-                  <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
-                  <div style={{ fontWeight: 900, marginBottom: 14 }}>{shortSig(selectedSig)}</div>
+              <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
+                {!selectedSig ? (
+                  <div style={{ opacity: 0.75, fontSize: 13 }}>
+                    Select a transaction to add context and supporting evidence.
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
+                    <div style={{ fontWeight: 900, marginBottom: 14 }}>{shortSig(selectedSig)}</div>
 
-                  <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                    Category
-                  </label>
-                  <select
-                    value={editLabel}
-                    onChange={(e) => setEditLabel(e.target.value as LabelType)}
-                    style={{
-                      width: "100%",
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      border: "1px solid rgba(0,0,0,0.25)",
-                      outline: "none",
-                      background: "rgba(0,0,0,0.04)",
-                      marginBottom: 12,
-                      fontWeight: 800,
-                    }}
-                  >
-                    {["Donation", "Grant", "Ops", "Milestone", "Other"].map((x) => (
-                      <option key={x} value={x}>
-                        {x}
-                      </option>
-                    ))}
-                  </select>
+                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                      Category
+                    </label>
+                    <select
+                      value={editLabel}
+                      onChange={(e) => setEditLabel(e.target.value as LabelType)}
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(0,0,0,0.25)",
+                        outline: "none",
+                        background: "rgba(0,0,0,0.04)",
+                        marginBottom: 12,
+                        fontWeight: 800,
+                      }}
+                    >
+                      {["Donation", "Grant", "Ops", "Milestone", "Other"].map((x) => (
+                        <option key={x} value={x}>
+                          {x}
+                        </option>
+                      ))}
+                    </select>
 
-                  {editLabel === "Other" && (
-                    <>
-                      <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                        Custom Category Name
-                      </label>
-                      <input
-                        value={editOtherDetail}
-                        onChange={(e) => setEditOtherDetail(e.target.value)}
-                        placeholder="e.g., Sponsorship, Refund, Equipment"
+                    {editLabel === "Other" && (
+                      <>
+                        <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                          Custom Category Name
+                        </label>
+                        <input
+                          value={editOtherDetail}
+                          onChange={(e) => setEditOtherDetail(e.target.value)}
+                          placeholder="e.g., Sponsorship, Refund, Equipment"
+                          style={{
+                            width: "100%",
+                            padding: "10px 12px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(0,0,0,0.18)",
+                            outline: "none",
+                            marginBottom: 12,
+                          }}
+                        />
+                      </>
+                    )}
+
+                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                      Description
+                    </label>
+                    <input
+                      value={editNote}
+                      onChange={(e) => setEditNote(e.target.value)}
+                      placeholder="Brief explanation of transaction purpose"
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(0,0,0,0.18)",
+                        outline: "none",
+                        marginBottom: 12,
+                      }}
+                    />
+
+                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                      Supporting Link
+                    </label>
+                    <input
+                      value={editProof}
+                      onChange={(e) => setEditProof(e.target.value)}
+                      placeholder="https://documentation-or-proof-link"
+                      style={{
+                        width: "100%",
+                        padding: "10px 12px",
+                        borderRadius: 10,
+                        border: "1px solid rgba(0,0,0,0.18)",
+                        outline: "none",
+                        marginBottom: 14,
+                      }}
+                    />
+
+                    <div style={{ display: "flex", gap: 10 }}>
+                      <button
+                        onClick={saveMeta}
                         style={{
-                          width: "100%",
                           padding: "10px 12px",
                           borderRadius: 10,
-                          border: "1px solid rgba(0,0,0,0.18)",
-                          outline: "none",
-                          marginBottom: 12,
+                          border: "1px solid rgba(0,0,0,0.15)",
+                          background: "#111",
+                          color: "white",
+                          fontWeight: 900,
+                          cursor: "pointer",
+                          flex: 1,
                         }}
-                      />
-                    </>
-                  )}
+                      >
+                        Save Annotation
+                      </button>
+                      <button
+                        onClick={clearMeta}
+                        style={{
+                          padding: "10px 12px",
+                          borderRadius: 10,
+                          border: "1px solid rgba(0,0,0,0.15)",
+                          background: "rgba(0,0,0,0.04)",
+                          fontWeight: 900,
+                          cursor: "pointer",
+                        }}
+                      >
+                        Remove Annotation
+                      </button>
+                    </div>
 
-                  <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                    Description
-                  </label>
-                  <input
-                    value={editNote}
-                    onChange={(e) => setEditNote(e.target.value)}
-                    placeholder="Brief explanation of transaction purpose"
-                    style={{
-                      width: "100%",
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      border: "1px solid rgba(0,0,0,0.18)",
-                      outline: "none",
-                      marginBottom: 12,
-                    }}
-                  />
+                    {saveMsg && <div style={{ marginTop: 10, fontSize: 13 }}>{saveMsg}</div>}
+                  </>
+                )}
+              </div>
 
-                  <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                    Supporting Link
-                  </label>
-                  <input
-                    value={editProof}
-                    onChange={(e) => setEditProof(e.target.value)}
-                    placeholder="https://documentation-or-proof-link"
-                    style={{
-                      width: "100%",
-                      padding: "10px 12px",
-                      borderRadius: 10,
-                      border: "1px solid rgba(0,0,0,0.18)",
-                      outline: "none",
-                      marginBottom: 14,
-                    }}
-                  />
-
-                  <div style={{ display: "flex", gap: 10 }}>
-                    <button
-                      onClick={saveMeta}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.15)",
-                        background: "#111",
-                        color: "white",
-                        fontWeight: 900,
-                        cursor: "pointer",
-                        flex: 1,
-                      }}
-                    >
-                      Save Classification
-                    </button>
-                    <button
-                      onClick={clearMeta}
-                      style={{
-                        padding: "10px 12px",
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.15)",
-                        background: "rgba(0,0,0,0.04)",
-                        fontWeight: 900,
-                        cursor: "pointer",
-                      }}
-                    >
-                      Remove Classification
-                    </button>
-                  </div>
-
-                  {saveMsg && <div style={{ marginTop: 10, fontSize: 13 }}>{saveMsg}</div>}
-                </>
-              )}
+              <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
+                Next: mainnet toggle + deploy + docs.
+              </div>
             </div>
-
-            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-              Next: add mainnet toggle + public share view.
-            </div>
-          </div>
+          )}
         </div>
       )}
 
-      {/* Classified Transactions Tab */}
-      {tab === "Classified Transactions" && (
+      {/* Treasury Ledger Tab */}
+      {tab === "Treasury Ledger" && (
         <div style={{ marginTop: 18, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 16, fontWeight: 900 }}>Classified Transactions</div>
+            <div style={{ fontSize: 16, fontWeight: 900 }}>Treasury Ledger</div>
             <input
-              value={searchSaved}
-              onChange={(e) => setSearchSaved(e.target.value)}
+              value={searchLedger}
+              onChange={(e) => setSearchLedger(e.target.value)}
               placeholder="Search by signature, category, description…"
               style={{
                 padding: "10px 12px",
@@ -590,11 +667,11 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 12 }}>
-            {savedEntries.length === 0 ? (
-              <div style={{ opacity: 0.75 }}>No classifications found.</div>
+            {ledgerRows.length === 0 ? (
+              <div style={{ opacity: 0.75 }}>No ledger entries found.</div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {savedEntries.slice(0, 200).map(([sig, m]) => (
+                {ledgerRows.slice(0, 250).map(([sig, m]) => (
                   <div
                     key={sig}
                     style={{
@@ -618,9 +695,7 @@ export default function App() {
 
                     <div style={{ fontWeight: 900, color: labelColor(m.label) }}>{m.label}</div>
 
-                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>
-                      {m.note ?? ""}
-                    </div>
+                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>{m.note ?? ""}</div>
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       {m.proofUrl && (
@@ -628,20 +703,24 @@ export default function App() {
                           link
                         </a>
                       )}
-                      <button
-                        onClick={() => selectTx(sig, { goEditor: true })}
-                        style={{
-                          padding: "8px 10px",
-                          borderRadius: 10,
-                          border: "1px solid rgba(0,0,0,0.15)",
-                          background: "#111",
-                          color: "white",
-                          fontWeight: 900,
-                          cursor: "pointer",
-                        }}
-                      >
-                        edit
-                      </button>
+
+                      {/* Hide edit in Public View */}
+                      {!isPublicView && (
+                        <button
+                          onClick={() => selectTx(sig, { goEditor: true })}
+                          style={{
+                            padding: "8px 10px",
+                            borderRadius: 10,
+                            border: "1px solid rgba(0,0,0,0.15)",
+                            background: "#111",
+                            color: "white",
+                            fontWeight: 900,
+                            cursor: "pointer",
+                          }}
+                        >
+                          edit
+                        </button>
+                      )}
                     </div>
                   </div>
                 ))}
@@ -650,7 +729,7 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-            Tip: Click “edit” to return to the Dashboard and open the editor automatically.
+            {isPublicView ? "Public view is read-only." : "Tip: Click “edit” to jump back into the editor."}
           </div>
         </div>
       )}
