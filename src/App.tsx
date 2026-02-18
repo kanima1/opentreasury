@@ -273,6 +273,47 @@ export default function App() {
     alert("Public view link copied ✅");
   }
 
+  function exportLedger() {
+    const payload = {
+      version: 1,
+      cluster: "devnet",
+      treasury: treasury.trim(),
+      exportedAt: new Date().toISOString(),
+      meta,
+    };
+
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {
+      type: "application/json",
+    });
+    const url = URL.createObjectURL(blob);
+
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `opentreasury-ledger-${treasury.trim().slice(0, 6)}.json`;
+    a.click();
+
+    URL.revokeObjectURL(url);
+  }
+
+  function importLedgerFile(file: File) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const parsed = JSON.parse(String(reader.result));
+        if (!parsed?.meta || typeof parsed.meta !== "object") {
+          alert("Invalid ledger file (missing meta).");
+          return;
+        }
+        setMeta(parsed.meta);
+        localStorage.setItem(storageKey(treasury), JSON.stringify(parsed.meta));
+        alert("Ledger imported ✅");
+      } catch {
+        alert("Could not read ledger JSON.");
+      }
+    };
+    reader.readAsText(file);
+  }
+
   return (
     <div
       style={{
@@ -291,6 +332,23 @@ export default function App() {
           ? "Read-only view for sharing."
           : "Annotations are stored locally in your browser."}
       </p>
+
+      {isPublicView && (
+        <div
+          style={{
+            marginTop: 12,
+            padding: 12,
+            borderRadius: 12,
+            border: "1px solid rgba(0,0,0,0.12)",
+            background: "rgba(0,0,0,0.03)",
+            fontSize: 13,
+          }}
+        >
+          Public view is read-only. To share annotations with reviewers, export
+          the Ledger JSON from private view and include it with your submission
+          (or import it on a review machine).
+        </div>
+      )}
 
       {/* Top Controls */}
       <div
@@ -345,11 +403,11 @@ export default function App() {
         </div>
 
         {!isPublicView && (
-          <div style={{ minWidth: 220 }}>
+          <div style={{ minWidth: 320, display: "flex", gap: 10, flexWrap: "wrap" }}>
             <button
               onClick={copyPublicLink}
               style={{
-                width: "100%",
+                flex: 1,
                 padding: "10px 12px",
                 borderRadius: 12,
                 border: "1px solid rgba(0,0,0,0.15)",
@@ -361,6 +419,46 @@ export default function App() {
             >
               Copy Public View Link
             </button>
+
+            <button
+              onClick={exportLedger}
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: 12,
+                border: "1px solid rgba(0,0,0,0.15)",
+                background: "rgba(0,0,0,0.06)",
+                fontWeight: 900,
+                cursor: "pointer",
+              }}
+            >
+              Download Ledger JSON
+            </button>
+
+            <label
+              style={{
+                flex: 1,
+                padding: "10px 12px",
+                borderRadius: 12,
+                border: "1px solid rgba(0,0,0,0.15)",
+                background: "rgba(0,0,0,0.06)",
+                fontWeight: 900,
+                cursor: "pointer",
+                textAlign: "center",
+              }}
+            >
+              Import Ledger JSON
+              <input
+                type="file"
+                accept="application/json"
+                style={{ display: "none" }}
+                onChange={(e) => {
+                  const file = e.target.files?.[0];
+                  if (file) importLedgerFile(file);
+                  e.currentTarget.value = "";
+                }}
+              />
+            </label>
           </div>
         )}
       </div>
@@ -436,7 +534,13 @@ export default function App() {
                 borderRadius: 12,
               }}
             >
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+              <table
+                style={{
+                  width: "100%",
+                  borderCollapse: "collapse",
+                  fontSize: 13,
+                }}
+              >
                 <thead style={{ background: "rgba(0,0,0,0.03)" }}>
                   <tr>
                     <th style={{ textAlign: "left", padding: 10 }}>Signature</th>
@@ -468,7 +572,9 @@ export default function App() {
                           style={{
                             cursor: isPublicView ? "default" : "pointer",
                             borderTop: "1px solid rgba(0,0,0,0.08)",
-                            background: isSelected ? "rgba(0,0,0,0.04)" : "transparent",
+                            background: isSelected
+                              ? "rgba(0,0,0,0.04)"
+                              : "transparent",
                           }}
                         >
                           <td style={{ padding: 10 }}>
@@ -483,15 +589,31 @@ export default function App() {
                               {shortSig(t.signature)}
                             </a>
                           </td>
-                          <td style={{ padding: 10 }}>{formatTime(t.blockTime)}</td>
-                          <td style={{ padding: 10, fontWeight: 900, color: labelColor(label) }}>
+                          <td style={{ padding: 10 }}>
+                            {formatTime(t.blockTime)}
+                          </td>
+                          <td
+                            style={{
+                              padding: 10,
+                              fontWeight: 900,
+                              color: labelColor(label),
+                            }}
+                          >
                             {label}
                           </td>
                           <td style={{ padding: 10 }}>
                             {t.err ? (
-                              <span style={{ color: "#dc2626", fontWeight: 800 }}>Failed</span>
+                              <span
+                                style={{ color: "#dc2626", fontWeight: 800 }}
+                              >
+                                Failed
+                              </span>
                             ) : (
-                              <span style={{ color: "#16a34a", fontWeight: 800 }}>Confirmed</span>
+                              <span
+                                style={{ color: "#16a34a", fontWeight: 800 }}
+                              >
+                                Confirmed
+                              </span>
                             )}
                           </td>
                         </tr>
@@ -503,7 +625,8 @@ export default function App() {
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-              Tip: The ledger tab is your searchable index of annotated transactions.
+              Tip: The ledger tab is your searchable index of annotated
+              transactions.
             </div>
           </div>
 
@@ -514,22 +637,41 @@ export default function App() {
                 Transaction Annotation
               </h2>
 
-              <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
+              <div
+                style={{
+                  border: "1px solid rgba(0,0,0,0.12)",
+                  borderRadius: 12,
+                  padding: 12,
+                }}
+              >
                 {!selectedSig ? (
                   <div style={{ opacity: 0.75, fontSize: 13 }}>
                     Select a transaction to add context and supporting evidence.
                   </div>
                 ) : (
                   <>
-                    <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
-                    <div style={{ fontWeight: 900, marginBottom: 14 }}>{shortSig(selectedSig)}</div>
+                    <div style={{ fontSize: 12, opacity: 0.75 }}>
+                      Selected Transaction
+                    </div>
+                    <div style={{ fontWeight: 900, marginBottom: 14 }}>
+                      {shortSig(selectedSig)}
+                    </div>
 
-                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                    <label
+                      style={{
+                        display: "block",
+                        fontSize: 12,
+                        opacity: 0.75,
+                        marginBottom: 6,
+                      }}
+                    >
                       Category
                     </label>
                     <select
                       value={editLabel}
-                      onChange={(e) => setEditLabel(e.target.value as LabelType)}
+                      onChange={(e) =>
+                        setEditLabel(e.target.value as LabelType)
+                      }
                       style={{
                         width: "100%",
                         padding: "10px 12px",
@@ -541,16 +683,25 @@ export default function App() {
                         fontWeight: 800,
                       }}
                     >
-                      {["Donation", "Grant", "Ops", "Milestone", "Other"].map((x) => (
-                        <option key={x} value={x}>
-                          {x}
-                        </option>
-                      ))}
+                      {["Donation", "Grant", "Ops", "Milestone", "Other"].map(
+                        (x) => (
+                          <option key={x} value={x}>
+                            {x}
+                          </option>
+                        )
+                      )}
                     </select>
 
                     {editLabel === "Other" && (
                       <>
-                        <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                        <label
+                          style={{
+                            display: "block",
+                            fontSize: 12,
+                            opacity: 0.75,
+                            marginBottom: 6,
+                          }}
+                        >
                           Custom Category Name
                         </label>
                         <input
@@ -569,7 +720,14 @@ export default function App() {
                       </>
                     )}
 
-                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                    <label
+                      style={{
+                        display: "block",
+                        fontSize: 12,
+                        opacity: 0.75,
+                        marginBottom: 6,
+                      }}
+                    >
                       Description
                     </label>
                     <input
@@ -586,7 +744,14 @@ export default function App() {
                       }}
                     />
 
-                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+                    <label
+                      style={{
+                        display: "block",
+                        fontSize: 12,
+                        opacity: 0.75,
+                        marginBottom: 6,
+                      }}
+                    >
                       Supporting Link
                     </label>
                     <input
@@ -634,7 +799,11 @@ export default function App() {
                       </button>
                     </div>
 
-                    {saveMsg && <div style={{ marginTop: 10, fontSize: 13 }}>{saveMsg}</div>}
+                    {saveMsg && (
+                      <div style={{ marginTop: 10, fontSize: 13 }}>
+                        {saveMsg}
+                      </div>
+                    )}
                   </>
                 )}
               </div>
@@ -649,8 +818,22 @@ export default function App() {
 
       {/* Treasury Ledger Tab */}
       {tab === "Treasury Ledger" && (
-        <div style={{ marginTop: 18, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+        <div
+          style={{
+            marginTop: 18,
+            border: "1px solid rgba(0,0,0,0.12)",
+            borderRadius: 12,
+            padding: 12,
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
             <div style={{ fontSize: 16, fontWeight: 900 }}>Treasury Ledger</div>
             <input
               value={searchLedger}
@@ -693,13 +876,22 @@ export default function App() {
                       {shortSig(sig)}
                     </a>
 
-                    <div style={{ fontWeight: 900, color: labelColor(m.label) }}>{m.label}</div>
+                    <div style={{ fontWeight: 900, color: labelColor(m.label) }}>
+                      {m.label}
+                    </div>
 
-                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>{m.note ?? ""}</div>
+                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>
+                      {m.note ?? ""}
+                    </div>
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       {m.proofUrl && (
-                        <a href={m.proofUrl} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
+                        <a
+                          href={m.proofUrl}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{ textDecoration: "none" }}
+                        >
                           link
                         </a>
                       )}
@@ -729,7 +921,9 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-            {isPublicView ? "Public view is read-only." : "Tip: Click “edit” to jump back into the editor."}
+            {isPublicView
+              ? "Public view is read-only."
+              : "Tip: Click “edit” to jump back into the editor."}
           </div>
         </div>
       )}
