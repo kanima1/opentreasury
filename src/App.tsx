@@ -13,11 +13,11 @@ type LabelType = "Donation" | "Grant" | "Ops" | "Milestone" | "Other";
 
 type TxMeta = {
   label: LabelType;
-  note?: string; // "Description" (and stores Other detail via "Other: ...")
-  proofUrl?: string; // "Supporting Link"
+  note?: string; // Description (and stores Other detail via "Other: ...")
+  proofUrl?: string; // Supporting Link
 };
 
-type Tab = "Dashboard" | "Classified Transactions";
+type Tab = "Dashboard" | "Treasury Ledger";
 
 const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111"; // placeholder (valid address)
 
@@ -68,7 +68,7 @@ function parseOtherDetail(note?: string) {
 }
 
 export default function App() {
-  // Public view detection
+  // Public view detection (?view=public)
   const searchParams = new URLSearchParams(window.location.search);
   const isPublicView = searchParams.get("view") === "public";
 
@@ -84,22 +84,22 @@ export default function App() {
   const [selectedSig, setSelectedSig] = useState<string | null>(null);
 
   const [editLabel, setEditLabel] = useState<LabelType>("Donation");
-  const [editOtherDetail, setEditOtherDetail] = useState<string>(""); // only used when label = Other
-  const [editNote, setEditNote] = useState<string>(""); // "Description"
-  const [editProof, setEditProof] = useState<string>(""); // "Supporting Link"
+  const [editOtherDetail, setEditOtherDetail] = useState<string>(""); // only when label=Other
+  const [editNote, setEditNote] = useState<string>(""); // Description
+  const [editProof, setEditProof] = useState<string>(""); // Supporting Link
   const [saveMsg, setSaveMsg] = useState<string>("");
 
-  const [searchSaved, setSearchSaved] = useState<string>("");
+  const [searchLedger, setSearchLedger] = useState<string>("");
 
   const editorRef = useRef<HTMLDivElement | null>(null);
 
-  // Devnet for now (safe + free). We'll add mainnet toggle later.
+  // Devnet for now
   const connection = useMemo(
     () => new Connection("https://api.devnet.solana.com", "confirmed"),
     []
   );
 
-  // Load saved classifications for current treasury
+  // Load saved labels (local)
   useEffect(() => {
     try {
       const raw = localStorage.getItem(storageKey(treasury));
@@ -109,10 +109,10 @@ export default function App() {
     }
     setSelectedSig(null);
     setSaveMsg("");
-    setSearchSaved("");
+    setSearchLedger("");
   }, [treasury]);
 
-  // Fetch balance + tx list
+  // Fetch balance + txs
   useEffect(() => {
     let cancelled = false;
 
@@ -136,14 +136,15 @@ export default function App() {
         );
         if (cancelled) return;
 
-        const rows: TxRow[] = sigs.map((s) => ({
-          signature: s.signature,
-          slot: s.slot,
-          blockTime: s.blockTime,
-          err: s.err ? JSON.stringify(s.err) : null,
-        }));
+        setTxs(
+          sigs.map((s) => ({
+            signature: s.signature,
+            slot: s.slot,
+            blockTime: s.blockTime,
+            err: s.err ? JSON.stringify(s.err) : null,
+          }))
+        );
 
-        setTxs(rows);
         setStatus("Loaded ✅");
       } catch (e: any) {
         setStatus("");
@@ -157,7 +158,7 @@ export default function App() {
     };
   }, [treasury, connection]);
 
-  // When selecting a tx, populate editor fields with saved values
+  // Populate editor when tx is selected
   useEffect(() => {
     if (!selectedSig) return;
 
@@ -168,7 +169,7 @@ export default function App() {
 
       if (saved.label === "Other") {
         setEditOtherDetail(parseOtherDetail(saved.note));
-        // If note includes extra info like "Other: X | Y", keep Y as Description
+        // If note looks like "Other: X | Y", keep Y as Description
         const parts = (saved.note ?? "").split("|").map((p) => p.trim());
         if (parts.length >= 2) setEditNote(parts.slice(1).join(" | "));
         else setEditNote("");
@@ -186,7 +187,7 @@ export default function App() {
     setSaveMsg("");
   }, [selectedSig, meta]);
 
-  // If user changes label away from Other, clear Other detail
+  // If label changes away from Other, clear the custom name field
   useEffect(() => {
     if (editLabel !== "Other") setEditOtherDetail("");
   }, [editLabel]);
@@ -196,7 +197,8 @@ export default function App() {
   }
 
   function selectTx(sig: string, opts?: { goEditor?: boolean }) {
-    if (isPublicView) return; // public = read-only
+    if (isPublicView) return; // public view is read-only
+
     setSelectedSig(sig);
     if (opts?.goEditor) {
       setTimeout(() => {
@@ -207,8 +209,7 @@ export default function App() {
   }
 
   function saveMeta() {
-    if (!selectedSig) return;
-    if (isPublicView) return;
+    if (!selectedSig || isPublicView) return;
 
     const trimmedProof = editProof.trim();
     if (trimmedProof && !isValidHttpUrl(trimmedProof)) {
@@ -219,10 +220,9 @@ export default function App() {
     const desc = editNote.trim();
     const other = editOtherDetail.trim();
 
-    let finalNote: string | undefined = undefined;
+    let finalNote: string | undefined;
 
     if (editLabel === "Other") {
-      // Store as: "Other: <custom>" + optionally " | <description>"
       const base = other ? `Other: ${other}` : "Other";
       finalNote = desc ? `${base} | ${desc}` : other ? base : undefined;
     } else {
@@ -244,8 +244,7 @@ export default function App() {
   }
 
   function clearMeta() {
-    if (!selectedSig) return;
-    if (isPublicView) return;
+    if (!selectedSig || isPublicView) return;
 
     const next = { ...meta };
     delete next[selectedSig];
@@ -254,10 +253,10 @@ export default function App() {
     setSaveMsg("Removed ✅");
   }
 
-  const labeledCount = Object.keys(meta).length;
+  const ledgerEntries = Object.keys(meta).length;
 
-  const savedEntries = Object.entries(meta).filter(([sig, m]) => {
-    const q = searchSaved.trim().toLowerCase();
+  const ledgerRows = Object.entries(meta).filter(([sig, m]) => {
+    const q = searchLedger.trim().toLowerCase();
     if (!q) return true;
     return (
       sig.toLowerCase().includes(q) ||
@@ -268,10 +267,8 @@ export default function App() {
   });
 
   function copyPublicLink() {
-    // Keep current origin + path, add query param view=public
     const url = new URL(window.location.href);
     url.searchParams.set("view", "public");
-    // Optional: preserve treasury address in the URL later (we can add this next)
     navigator.clipboard.writeText(url.toString());
     alert("Public view link copied ✅");
   }
@@ -292,13 +289,28 @@ export default function App() {
         Treasury transparency dashboard (devnet).{" "}
         {isPublicView
           ? "Read-only view for sharing."
-          : "Classifications are stored locally in your browser."}
+          : "Annotations are stored locally in your browser."}
       </p>
 
       {/* Top Controls */}
-      <div style={{ display: "flex", gap: 12, flexWrap: "wrap", alignItems: "end", marginTop: 16 }}>
+      <div
+        style={{
+          display: "flex",
+          gap: 12,
+          flexWrap: "wrap",
+          alignItems: "end",
+          marginTop: 16,
+        }}
+      >
         <div style={{ flex: 1, minWidth: 320 }}>
-          <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
+          <label
+            style={{
+              display: "block",
+              fontSize: 12,
+              opacity: 0.75,
+              marginBottom: 6,
+            }}
+          >
             Treasury Wallet Address
           </label>
           <input
@@ -328,12 +340,12 @@ export default function App() {
         </div>
 
         <div style={{ minWidth: 180 }}>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>Classified Transactions</div>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{labeledCount}</div>
+          <div style={{ fontSize: 12, opacity: 0.75 }}>Ledger Entries</div>
+          <div style={{ fontSize: 14, fontWeight: 700 }}>{ledgerEntries}</div>
         </div>
 
         {!isPublicView && (
-          <div style={{ minWidth: 210 }}>
+          <div style={{ minWidth: 220 }}>
             <button
               onClick={copyPublicLink}
               style={{
@@ -370,18 +382,18 @@ export default function App() {
           Dashboard
         </button>
         <button
-          onClick={() => setTab("Classified Transactions")}
+          onClick={() => setTab("Treasury Ledger")}
           style={{
             padding: "10px 12px",
             borderRadius: 12,
             border: "1px solid rgba(0,0,0,0.15)",
-            background: tab === "Classified Transactions" ? "#111" : "rgba(0,0,0,0.06)",
-            color: tab === "Classified Transactions" ? "white" : "black",
+            background: tab === "Treasury Ledger" ? "#111" : "rgba(0,0,0,0.06)",
+            color: tab === "Treasury Ledger" ? "white" : "black",
             fontWeight: 900,
             cursor: "pointer",
           }}
         >
-          Classified Transactions ({labeledCount})
+          Treasury Ledger ({ledgerEntries})
         </button>
       </div>
 
@@ -404,20 +416,33 @@ export default function App() {
 
       {/* Dashboard Tab */}
       {tab === "Dashboard" && (
-        <div style={{ display: "grid", gridTemplateColumns: "1.5fr 1fr", gap: 14, marginTop: 20 }}>
+        <div
+          style={{
+            display: "grid",
+            gridTemplateColumns: "1.5fr 1fr",
+            gap: 14,
+            marginTop: 20,
+          }}
+        >
           <div>
             <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
-              Recent Transactions (select to classify)
+              Recent Transactions {isPublicView ? "" : "(select to annotate)"}
             </h2>
 
-            <div style={{ overflowX: "auto", border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12 }}>
+            <div
+              style={{
+                overflowX: "auto",
+                border: "1px solid rgba(0,0,0,0.12)",
+                borderRadius: 12,
+              }}
+            >
               <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead style={{ background: "rgba(0,0,0,0.03)" }}>
                   <tr>
                     <th style={{ textAlign: "left", padding: 10 }}>Signature</th>
                     <th style={{ textAlign: "left", padding: 10 }}>Time</th>
                     <th style={{ textAlign: "left", padding: 10 }}>Category</th>
-                    <th style={{ textAlign: "left", padding: 10 }}>Error</th>
+                    <th style={{ textAlign: "left", padding: 10 }}>Status</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -431,6 +456,7 @@ export default function App() {
                     txs.map((t) => {
                       const isSelected = selectedSig === t.signature;
                       const label = meta[t.signature]?.label ?? "—";
+
                       return (
                         <tr
                           key={t.signature}
@@ -461,7 +487,13 @@ export default function App() {
                           <td style={{ padding: 10, fontWeight: 900, color: labelColor(label) }}>
                             {label}
                           </td>
-                          <td style={{ padding: 10 }}>{t.err ?? "—"}</td>
+                          <td style={{ padding: 10 }}>
+                            {t.err ? (
+                              <span style={{ color: "#dc2626", fontWeight: 800 }}>Failed</span>
+                            ) : (
+                              <span style={{ color: "#16a34a", fontWeight: 800 }}>Confirmed</span>
+                            )}
+                          </td>
                         </tr>
                       );
                     })
@@ -471,21 +503,21 @@ export default function App() {
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-              Tip: Use “Classified Transactions” to search and revisit any classification.
+              Tip: The ledger tab is your searchable index of annotated transactions.
             </div>
           </div>
 
-          {/* Classification editor (hidden in Public View) */}
+          {/* Editor (hidden in Public View) */}
           {!isPublicView && (
             <div ref={editorRef}>
               <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
-                Transaction Classification
+                Transaction Annotation
               </h2>
 
               <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
                 {!selectedSig ? (
                   <div style={{ opacity: 0.75, fontSize: 13 }}>
-                    Select a transaction to classify and document its purpose.
+                    Select a transaction to add context and supporting evidence.
                   </div>
                 ) : (
                   <>
@@ -585,7 +617,7 @@ export default function App() {
                           flex: 1,
                         }}
                       >
-                        Save Classification
+                        Save Annotation
                       </button>
                       <button
                         onClick={clearMeta}
@@ -598,7 +630,7 @@ export default function App() {
                           cursor: "pointer",
                         }}
                       >
-                        Remove Classification
+                        Remove Annotation
                       </button>
                     </div>
 
@@ -608,21 +640,21 @@ export default function App() {
               </div>
 
               <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-                Next: add mainnet toggle + deployment + docs.
+                Next: mainnet toggle + deploy + docs.
               </div>
             </div>
           )}
         </div>
       )}
 
-      {/* Classified Transactions Tab */}
-      {tab === "Classified Transactions" && (
+      {/* Treasury Ledger Tab */}
+      {tab === "Treasury Ledger" && (
         <div style={{ marginTop: 18, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 16, fontWeight: 900 }}>Classified Transactions</div>
+            <div style={{ fontSize: 16, fontWeight: 900 }}>Treasury Ledger</div>
             <input
-              value={searchSaved}
-              onChange={(e) => setSearchSaved(e.target.value)}
+              value={searchLedger}
+              onChange={(e) => setSearchLedger(e.target.value)}
               placeholder="Search by signature, category, description…"
               style={{
                 padding: "10px 12px",
@@ -635,11 +667,11 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 12 }}>
-            {savedEntries.length === 0 ? (
-              <div style={{ opacity: 0.75 }}>No classifications found.</div>
+            {ledgerRows.length === 0 ? (
+              <div style={{ opacity: 0.75 }}>No ledger entries found.</div>
             ) : (
               <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {savedEntries.slice(0, 200).map(([sig, m]) => (
+                {ledgerRows.slice(0, 250).map(([sig, m]) => (
                   <div
                     key={sig}
                     style={{
@@ -697,9 +729,7 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-            {isPublicView
-              ? "Public view is read-only."
-              : "Tip: Click “edit” to return to the Dashboard and open the editor automatically."}
+            {isPublicView ? "Public view is read-only." : "Tip: Click “edit” to jump back into the editor."}
           </div>
         </div>
       )}
