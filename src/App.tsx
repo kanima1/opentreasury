@@ -1,5 +1,14 @@
+import { Buffer } from "buffer";
+(window as any).Buffer = Buffer;
+
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from "@solana/web3.js";
+import {
+  Connection,
+  PublicKey,
+  LAMPORTS_PER_SOL,
+  Transaction,
+  TransactionInstruction,
+} from "@solana/web3.js";
 import "./App.css";
 
 type TxRow = {
@@ -13,13 +22,16 @@ type LabelType = "Donation" | "Grant" | "Ops" | "Milestone" | "Other";
 
 type TxMeta = {
   label: LabelType;
-  note?: string; // Description (and stores Other detail via "Other: ...")
-  proofUrl?: string; // Supporting Link
+  note?: string;
+  proofUrl?: string;
 };
 
 type Tab = "Dashboard" | "Treasury Ledger";
 
-const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111"; // placeholder (valid address)
+const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111";
+const MEMO_PROGRAM_ID = new PublicKey(
+  "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
+);
 
 function shortSig(sig: string) {
   return sig.slice(0, 6) + "…" + sig.slice(-6);
@@ -46,29 +58,66 @@ function storageKey(treasury: string) {
 function labelColor(label: LabelType | "—") {
   switch (label) {
     case "Donation":
-      return "#16a34a"; // green
+      return "#16a34a";
     case "Grant":
-      return "#2563eb"; // blue
+      return "#2563eb";
     case "Ops":
-      return "#f59e0b"; // amber
+      return "#f59e0b";
     case "Milestone":
-      return "#9333ea"; // purple
+      return "#9333ea";
     case "Other":
-      return "#64748b"; // gray
+      return "#64748b";
     default:
       return "#111";
   }
 }
 
-// If note is like "Other: xyz", extract "xyz"
 function parseOtherDetail(note?: string) {
   if (!note) return "";
   const m = note.match(/^other:\s*(.*)$/i);
   return m ? m[1] : "";
 }
 
+function toUtf8Bytes(s: string) {
+  return new TextEncoder().encode(s);
+}
+
+async function sha256Hex(input: string) {
+  const buf = await crypto.subtle.digest("SHA-256", toUtf8Bytes(input));
+  const bytes = new Uint8Array(buf);
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function stableStringify(obj: any) {
+  // Deterministic JSON stringify (sort keys recursively)
+  const seen = new WeakSet();
+  const sorter = (x: any): any => {
+    if (x && typeof x === "object") {
+      if (seen.has(x)) return x;
+      seen.add(x);
+
+      if (Array.isArray(x)) return x.map(sorter);
+      const keys = Object.keys(x).sort();
+      const out: any = {};
+      for (const k of keys) out[k] = sorter(x[k]);
+      return out;
+    }
+    return x;
+  };
+  return JSON.stringify(sorter(obj), null, 2);
+}
+
+type WalletProvider = {
+  publicKey?: PublicKey;
+  connect: () => Promise<any>;
+  disconnect?: () => Promise<void>;
+  signTransaction?: (tx: Transaction) => Promise<Transaction>;
+  signAndSendTransaction?: (tx: Transaction) => Promise<{ signature: string }>;
+};
+
 export default function App() {
-  // Public view detection (?view=public)
   const searchParams = new URLSearchParams(window.location.search);
   const isPublicView = searchParams.get("view") === "public";
 
@@ -84,22 +133,34 @@ export default function App() {
   const [selectedSig, setSelectedSig] = useState<string | null>(null);
 
   const [editLabel, setEditLabel] = useState<LabelType>("Donation");
-  const [editOtherDetail, setEditOtherDetail] = useState<string>(""); // only when label=Other
-  const [editNote, setEditNote] = useState<string>(""); // Description
-  const [editProof, setEditProof] = useState<string>(""); // Supporting Link
+  const [editOtherDetail, setEditOtherDetail] = useState<string>("");
+  const [editNote, setEditNote] = useState<string>("");
+  const [editProof, setEditProof] = useState<string>("");
   const [saveMsg, setSaveMsg] = useState<string>("");
 
   const [searchLedger, setSearchLedger] = useState<string>("");
 
+  // Proof state
+  const [walletAddress, setWalletAddress] = useState<string>("");
+  const [proofHash, setProofHash] = useState<string>("");
+  const [proofJson, setProofJson] = useState<string>("");
+  const [proofTxSig, setProofTxSig] = useState<string>("");
+  const [proofMsg, setProofMsg] = useState<string>("");
+
+  // Verification UI state
+  const [verifyTx, setVerifyTx] = useState<string>("");
+  const [verifyJson, setVerifyJson] = useState<string>("");
+  const [verifyMsg, setVerifyMsg] = useState<string>("");
+
   const editorRef = useRef<HTMLDivElement | null>(null);
 
-  // Devnet for now
+  // Devnet
   const connection = useMemo(
     () => new Connection("https://api.devnet.solana.com", "confirmed"),
     []
   );
 
-  // Load saved labels (local)
+  // Load saved annotations
   useEffect(() => {
     try {
       const raw = localStorage.getItem(storageKey(treasury));
@@ -110,6 +171,17 @@ export default function App() {
     setSelectedSig(null);
     setSaveMsg("");
     setSearchLedger("");
+
+    // reset proof (treasury changed)
+    setProofHash("");
+    setProofJson("");
+    setProofTxSig("");
+    setProofMsg("");
+
+    // reset verify
+    setVerifyTx("");
+    setVerifyJson("");
+    setVerifyMsg("");
   }, [treasury]);
 
   // Fetch balance + txs
@@ -169,7 +241,6 @@ export default function App() {
 
       if (saved.label === "Other") {
         setEditOtherDetail(parseOtherDetail(saved.note));
-        // If note looks like "Other: X | Y", keep Y as Description
         const parts = (saved.note ?? "").split("|").map((p) => p.trim());
         if (parts.length >= 2) setEditNote(parts.slice(1).join(" | "));
         else setEditNote("");
@@ -187,7 +258,6 @@ export default function App() {
     setSaveMsg("");
   }, [selectedSig, meta]);
 
-  // If label changes away from Other, clear the custom name field
   useEffect(() => {
     if (editLabel !== "Other") setEditOtherDetail("");
   }, [editLabel]);
@@ -197,8 +267,7 @@ export default function App() {
   }
 
   function selectTx(sig: string, opts?: { goEditor?: boolean }) {
-    if (isPublicView) return; // public view is read-only
-
+    if (isPublicView) return;
     setSelectedSig(sig);
     if (opts?.goEditor) {
       setTimeout(() => {
@@ -273,23 +342,247 @@ export default function App() {
     alert("Public view link copied ✅");
   }
 
-  function exportLedger() {
-    const payload = {
+  // ===== Protocol: OTMS + Proof =====
+  function buildOTMS() {
+    return {
       version: 1,
+      standard: "OTMS",
       cluster: "devnet",
       treasury: treasury.trim(),
       exportedAt: new Date().toISOString(),
-      meta,
+      entries: Object.entries(meta).map(([signature, m]) => ({
+        signature,
+        category: m.label,
+        description: m.note ?? "",
+        proofUrl: m.proofUrl ?? "",
+      })),
     };
+  }
 
-    const blob = new Blob([JSON.stringify(payload, null, 2)], {
-      type: "application/json",
-    });
+  async function generateProof() {
+    try {
+      setProofMsg("");
+      const otms = buildOTMS();
+      const json = stableStringify(otms);
+      const hash = await sha256Hex(json);
+
+      setProofJson(json);
+      setProofHash(hash);
+      setProofTxSig("");
+      setProofMsg("Proof generated ✅");
+
+      // helpful default for verification box
+      setVerifyJson(json);
+    } catch (e: any) {
+      setProofMsg(e?.message ?? "Could not generate proof.");
+    }
+  }
+
+  function getWalletProvider(): WalletProvider | null {
+    const w = window as any;
+    const provider = w?.solana;
+    if (!provider) return null;
+    // MVP: any wallet that injects window.solana (Phantom does)
+    return provider as WalletProvider;
+  }
+
+  async function connectWallet() {
+    try {
+      setProofMsg("");
+      const provider = getWalletProvider();
+      if (!provider) {
+        setProofMsg(
+          "No wallet provider found in browser. Install Phantom (or a wallet that injects window.solana)."
+        );
+        return;
+      }
+
+      const res = await provider.connect();
+      const pubkey =
+        res?.publicKey?.toString?.() ?? provider.publicKey?.toString?.();
+
+      setWalletAddress(pubkey || "");
+      setProofMsg(pubkey ? "Wallet connected ✅" : "Connected, but could not read address.");
+    } catch (e: any) {
+      setProofMsg(
+        e?.message ?? "Could not connect wallet (check popup / permissions)."
+      );
+    }
+  }
+
+  async function anchorProofOnChain() {
+    try {
+      setProofMsg("");
+      const provider = getWalletProvider();
+      if (!provider) {
+        setProofMsg("Wallet provider not found.");
+        return;
+      }
+      if (!provider.publicKey) {
+        setProofMsg("Connect your wallet first.");
+        return;
+      }
+      if (!proofHash) {
+        setProofMsg("Generate proof first (hash is empty).");
+        return;
+      }
+
+      const memoText = [
+        "OpenTreasury Proof (OTMS v1)",
+        `Treasury: ${treasury.trim()}`,
+        `Hash: ${proofHash}`,
+        `Timestamp: ${new Date().toISOString()}`,
+      ].join("\n");
+
+      const ix = new TransactionInstruction({
+        programId: MEMO_PROGRAM_ID,
+        keys: [],
+        // web3.js types vary; Buffer works at runtime. Cast keeps TS happy.
+        data: Buffer.from(memoText, "utf8") as any,
+      });
+
+      const tx = new Transaction().add(ix);
+      tx.feePayer = provider.publicKey;
+
+      const { blockhash, lastValidBlockHeight } =
+        await connection.getLatestBlockhash("confirmed");
+      tx.recentBlockhash = blockhash;
+
+      let sig = "";
+      if (provider.signAndSendTransaction) {
+        const sent = await provider.signAndSendTransaction(tx);
+        sig = sent?.signature ?? "";
+      } else if (provider.signTransaction) {
+        const signed = await provider.signTransaction(tx);
+        const raw = signed.serialize();
+        sig = await connection.sendRawTransaction(raw, { skipPreflight: false });
+      } else {
+        throw new Error("Wallet does not support sending transactions.");
+      }
+
+      await connection.confirmTransaction(
+        { signature: sig, blockhash, lastValidBlockHeight },
+        "confirmed"
+      );
+
+      setProofTxSig(sig);
+      setVerifyTx(sig); // auto-fill for verification
+      setProofMsg("Anchored on-chain ✅");
+    } catch (e: any) {
+      setProofMsg(e?.message ?? "Could not anchor proof on-chain.");
+    }
+  }
+
+  async function verifyProof() {
+    try {
+      setVerifyMsg("");
+
+      const sig = verifyTx.trim();
+      if (!sig) {
+        setVerifyMsg("❌ Paste a tx signature first.");
+        return;
+      }
+
+      const jsonText = verifyJson.trim();
+      if (!jsonText) {
+        setVerifyMsg("❌ Paste OTMS JSON first.");
+        return;
+      }
+
+      let parsedJson: any;
+      try {
+        parsedJson = JSON.parse(jsonText);
+      } catch {
+        setVerifyMsg("❌ OTMS JSON is not valid JSON.");
+        return;
+      }
+
+      // Compute hash from normalized JSON
+      const normalized = stableStringify(parsedJson);
+      const computedHash = await sha256Hex(normalized);
+
+      // ✅ Use parsed tx to reliably read Memo text (no manual base58 decoding)
+      const parsedTx = await connection.getParsedTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+
+      if (!parsedTx) {
+        setVerifyMsg("❌ Could not fetch that transaction (wrong cluster or signature?).");
+        return;
+      }
+
+      const ixs: any[] = (parsedTx.transaction?.message as any)?.instructions ?? [];
+      const memoIx = ixs.find((ix) => {
+        const pid =
+          typeof ix.programId === "string"
+            ? ix.programId
+            : ix.programId?.toString?.() ?? "";
+        return pid === MEMO_PROGRAM_ID.toBase58();
+      });
+
+      if (!memoIx) {
+        setVerifyMsg("❌ No Memo instruction found in this transaction.");
+        return;
+      }
+
+      // Memo program parsed output varies by RPC; cover common shapes
+      const memoText =
+        typeof memoIx.parsed === "string"
+          ? memoIx.parsed
+          : memoIx.parsed?.memo ?? memoIx.parsed ?? "";
+
+      if (!memoText || typeof memoText !== "string") {
+        setVerifyMsg("❌ Memo instruction found, but no readable memo text.");
+        return;
+      }
+
+      const hashLine = memoText
+        .split("\n")
+        .find((l) => l.toLowerCase().startsWith("hash:"));
+      const treasuryLine = memoText
+        .split("\n")
+        .find((l) => l.toLowerCase().startsWith("treasury:"));
+
+      const memoHash = (hashLine ?? "").replace(/^hash:\s*/i, "").trim();
+      const memoTreasury = (treasuryLine ?? "").replace(/^treasury:\s*/i, "").trim();
+
+      if (!memoHash) {
+        setVerifyMsg("❌ Memo found but could not read Hash line.");
+        return;
+      }
+
+      if (memoHash !== computedHash) {
+        setVerifyMsg(
+          `❌ Not verified.\nComputed hash: ${computedHash}\nMemo hash: ${memoHash}\n\nMemo text:\n${memoText}`
+        );
+        return;
+      }
+
+      // Optional treasury check
+      const jsonTreasury = String(parsedJson?.treasury ?? "").trim();
+      if (jsonTreasury && memoTreasury && jsonTreasury !== memoTreasury) {
+        setVerifyMsg(
+          `⚠️ Hash verified ✅ but treasury mismatch:\nJSON treasury: ${jsonTreasury}\nMemo treasury: ${memoTreasury}\n\nMemo text:\n${memoText}`
+        );
+        return;
+      }
+
+      setVerifyMsg(`✅ Verified!\nHash matches Memo.\n\nMemo text:\n${memoText}`);
+    } catch (e: any) {
+      setVerifyMsg(e?.message ?? "❌ Verification failed unexpectedly.");
+    }
+  }
+
+  function exportLedger() {
+    const payload = buildOTMS();
+    const json = stableStringify(payload);
+    const blob = new Blob([json], { type: "application/json" });
     const url = URL.createObjectURL(blob);
 
     const a = document.createElement("a");
     a.href = url;
-    a.download = `opentreasury-ledger-${treasury.trim().slice(0, 6)}.json`;
+    a.download = `opentreasury-otms-${treasury.trim().slice(0, 6)}.json`;
     a.click();
 
     URL.revokeObjectURL(url);
@@ -300,15 +593,34 @@ export default function App() {
     reader.onload = () => {
       try {
         const parsed = JSON.parse(String(reader.result));
-        if (!parsed?.meta || typeof parsed.meta !== "object") {
-          alert("Invalid ledger file (missing meta).");
+
+        // Backward compatible: accept {meta} or OTMS {entries}
+        if (parsed?.meta && typeof parsed.meta === "object") {
+          setMeta(parsed.meta);
+          localStorage.setItem(storageKey(treasury), JSON.stringify(parsed.meta));
+          alert("Ledger imported ✅");
           return;
         }
-        setMeta(parsed.meta);
-        localStorage.setItem(storageKey(treasury), JSON.stringify(parsed.meta));
-        alert("Ledger imported ✅");
+
+        if (parsed?.entries && Array.isArray(parsed.entries)) {
+          const next: Record<string, TxMeta> = {};
+          for (const e of parsed.entries) {
+            if (!e?.signature) continue;
+            next[e.signature] = {
+              label: (e.category as LabelType) || "Other",
+              note: e.description || "",
+              proofUrl: e.proofUrl || "",
+            };
+          }
+          setMeta(next);
+          localStorage.setItem(storageKey(treasury), JSON.stringify(next));
+          alert("OTMS imported ✅");
+          return;
+        }
+
+        alert("Invalid ledger file.");
       } catch {
-        alert("Could not read ledger JSON.");
+        alert("Could not read JSON.");
       }
     };
     reader.readAsText(file);
@@ -332,23 +644,6 @@ export default function App() {
           ? "Read-only view for sharing."
           : "Annotations are stored locally in your browser."}
       </p>
-
-      {isPublicView && (
-        <div
-          style={{
-            marginTop: 12,
-            padding: 12,
-            borderRadius: 12,
-            border: "1px solid rgba(0,0,0,0.12)",
-            background: "rgba(0,0,0,0.03)",
-            fontSize: 13,
-          }}
-        >
-          Public view is read-only. To share annotations with reviewers, export
-          the Ledger JSON from private view and include it with your submission
-          (or import it on a review machine).
-        </div>
-      )}
 
       {/* Top Controls */}
       <div
@@ -432,7 +727,7 @@ export default function App() {
                 cursor: "pointer",
               }}
             >
-              Download Ledger JSON
+              Download OTMS JSON
             </button>
 
             <label
@@ -447,7 +742,7 @@ export default function App() {
                 textAlign: "center",
               }}
             >
-              Import Ledger JSON
+              Import JSON
               <input
                 type="file"
                 accept="application/json"
@@ -462,6 +757,225 @@ export default function App() {
           </div>
         )}
       </div>
+
+      {/* Protocol Proof (private view only) */}
+      {!isPublicView && (
+        <div
+          style={{
+            marginTop: 14,
+            border: "1px solid rgba(0,0,0,0.12)",
+            borderRadius: 12,
+            padding: 12,
+            background: "rgba(0,0,0,0.02)",
+          }}
+        >
+          <div
+            style={{
+              display: "flex",
+              justifyContent: "space-between",
+              gap: 10,
+              flexWrap: "wrap",
+            }}
+          >
+            <div>
+              <div style={{ fontSize: 14, fontWeight: 900 }}>Protocol Proof</div>
+              <div style={{ fontSize: 12, opacity: 0.75 }}>
+                OTMS JSON → SHA-256 hash → anchor hash on-chain (Memo).
+              </div>
+            </div>
+
+            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+              <button
+                onClick={connectWallet}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  background: "#111",
+                  color: "white",
+                  fontWeight: 900,
+                  cursor: "pointer",
+                }}
+              >
+                {walletAddress
+                  ? `Wallet: ${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}`
+                  : "Connect Wallet"}
+              </button>
+
+              <button
+                onClick={generateProof}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  background: "rgba(0,0,0,0.06)",
+                  fontWeight: 900,
+                  cursor: "pointer",
+                }}
+              >
+                Generate Proof Hash
+              </button>
+
+              <button
+                onClick={anchorProofOnChain}
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 12,
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  background: proofHash ? "#111" : "rgba(0,0,0,0.12)",
+                  color: proofHash ? "white" : "rgba(0,0,0,0.45)",
+                  fontWeight: 900,
+                  cursor: proofHash ? "pointer" : "not-allowed",
+                }}
+                disabled={!proofHash}
+              >
+                Anchor On-Chain (Devnet)
+              </button>
+            </div>
+          </div>
+
+          <div style={{ marginTop: 10, fontSize: 13 }}>
+            <div style={{ opacity: 0.75 }}>Current Proof Hash</div>
+            <div
+              style={{
+                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                wordBreak: "break-all",
+              }}
+            >
+              {proofHash || "—"}
+            </div>
+
+            {proofTxSig && (
+              <div style={{ marginTop: 6 }}>
+                Anchored Tx:{" "}
+                <a
+                  href={`https://explorer.solana.com/tx/${proofTxSig}?cluster=devnet`}
+                  target="_blank"
+                  rel="noreferrer"
+                  style={{ fontWeight: 900, textDecoration: "none" }}
+                >
+                  {shortSig(proofTxSig)}
+                </a>
+              </div>
+            )}
+
+            {proofMsg && <div style={{ marginTop: 6 }}>{proofMsg}</div>}
+
+            {proofJson && (
+              <details style={{ marginTop: 10 }}>
+                <summary style={{ cursor: "pointer", fontWeight: 900 }}>
+                  View OTMS JSON (Proof Payload)
+                </summary>
+                <pre
+                  style={{
+                    marginTop: 10,
+                    padding: 12,
+                    borderRadius: 12,
+                    border: "1px solid rgba(0,0,0,0.12)",
+                    background: "rgba(0,0,0,0.03)",
+                    overflowX: "auto",
+                    fontSize: 12,
+                  }}
+                >
+                  {proofJson}
+                </pre>
+              </details>
+            )}
+          </div>
+
+          {/* Proof Verification */}
+          <div
+            style={{
+              marginTop: 14,
+              borderTop: "1px solid rgba(0,0,0,0.08)",
+              paddingTop: 12,
+            }}
+          >
+            <div style={{ fontSize: 14, fontWeight: 900 }}>Proof Verification</div>
+            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
+              Paste the on-chain tx signature + the OTMS JSON, then verify the hash matches the Memo.
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10 }}>
+              <input
+                value={verifyTx}
+                onChange={(e) => setVerifyTx(e.target.value)}
+                placeholder="Paste devnet tx signature here…"
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  outline: "none",
+                }}
+              />
+
+              <textarea
+                value={verifyJson}
+                onChange={(e) => setVerifyJson(e.target.value)}
+                placeholder="Paste OTMS JSON here…"
+                rows={8}
+                style={{
+                  width: "100%",
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.18)",
+                  outline: "none",
+                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
+                  fontSize: 12,
+                }}
+              />
+
+              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                <button
+                  onClick={verifyProof}
+                  style={{
+                    padding: "10px 12px",
+                    borderRadius: 12,
+                    border: "1px solid rgba(0,0,0,0.15)",
+                    background: "#111",
+                    color: "white",
+                    fontWeight: 900,
+                    cursor: "pointer",
+                  }}
+                >
+                  Verify Proof
+                </button>
+
+                {verifyTx.trim() && (
+                  <a
+                    href={`https://explorer.solana.com/tx/${verifyTx.trim()}?cluster=devnet`}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      alignSelf: "center",
+                      fontWeight: 900,
+                      textDecoration: "none",
+                    }}
+                  >
+                    Open Tx in Explorer →
+                  </a>
+                )}
+              </div>
+
+              {verifyMsg && (
+                <pre
+                  style={{
+                    marginTop: 6,
+                    padding: 12,
+                    borderRadius: 12,
+                    border: "1px solid rgba(0,0,0,0.12)",
+                    background: "rgba(0,0,0,0.03)",
+                    whiteSpace: "pre-wrap",
+                  }}
+                >
+                  {verifyMsg}
+                </pre>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Tabs */}
       <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
@@ -589,29 +1103,17 @@ export default function App() {
                               {shortSig(t.signature)}
                             </a>
                           </td>
-                          <td style={{ padding: 10 }}>
-                            {formatTime(t.blockTime)}
-                          </td>
-                          <td
-                            style={{
-                              padding: 10,
-                              fontWeight: 900,
-                              color: labelColor(label),
-                            }}
-                          >
+                          <td style={{ padding: 10 }}>{formatTime(t.blockTime)}</td>
+                          <td style={{ padding: 10, fontWeight: 900, color: labelColor(label) }}>
                             {label}
                           </td>
                           <td style={{ padding: 10 }}>
                             {t.err ? (
-                              <span
-                                style={{ color: "#dc2626", fontWeight: 800 }}
-                              >
+                              <span style={{ color: "#dc2626", fontWeight: 800 }}>
                                 Failed
                               </span>
                             ) : (
-                              <span
-                                style={{ color: "#16a34a", fontWeight: 800 }}
-                              >
+                              <span style={{ color: "#16a34a", fontWeight: 800 }}>
                                 Confirmed
                               </span>
                             )}
@@ -625,12 +1127,11 @@ export default function App() {
             </div>
 
             <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-              Tip: The ledger tab is your searchable index of annotated
-              transactions.
+              Tip: The ledger tab is your searchable index of annotated transactions.
             </div>
           </div>
 
-          {/* Editor (hidden in Public View) */}
+          {/* Editor */}
           {!isPublicView && (
             <div ref={editorRef}>
               <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
@@ -650,28 +1151,17 @@ export default function App() {
                   </div>
                 ) : (
                   <>
-                    <div style={{ fontSize: 12, opacity: 0.75 }}>
-                      Selected Transaction
-                    </div>
+                    <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
                     <div style={{ fontWeight: 900, marginBottom: 14 }}>
                       {shortSig(selectedSig)}
                     </div>
 
-                    <label
-                      style={{
-                        display: "block",
-                        fontSize: 12,
-                        opacity: 0.75,
-                        marginBottom: 6,
-                      }}
-                    >
+                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
                       Category
                     </label>
                     <select
                       value={editLabel}
-                      onChange={(e) =>
-                        setEditLabel(e.target.value as LabelType)
-                      }
+                      onChange={(e) => setEditLabel(e.target.value as LabelType)}
                       style={{
                         width: "100%",
                         padding: "10px 12px",
@@ -683,25 +1173,16 @@ export default function App() {
                         fontWeight: 800,
                       }}
                     >
-                      {["Donation", "Grant", "Ops", "Milestone", "Other"].map(
-                        (x) => (
-                          <option key={x} value={x}>
-                            {x}
-                          </option>
-                        )
-                      )}
+                      {["Donation", "Grant", "Ops", "Milestone", "Other"].map((x) => (
+                        <option key={x} value={x}>
+                          {x}
+                        </option>
+                      ))}
                     </select>
 
                     {editLabel === "Other" && (
                       <>
-                        <label
-                          style={{
-                            display: "block",
-                            fontSize: 12,
-                            opacity: 0.75,
-                            marginBottom: 6,
-                          }}
-                        >
+                        <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
                           Custom Category Name
                         </label>
                         <input
@@ -720,14 +1201,7 @@ export default function App() {
                       </>
                     )}
 
-                    <label
-                      style={{
-                        display: "block",
-                        fontSize: 12,
-                        opacity: 0.75,
-                        marginBottom: 6,
-                      }}
-                    >
+                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
                       Description
                     </label>
                     <input
@@ -744,14 +1218,7 @@ export default function App() {
                       }}
                     />
 
-                    <label
-                      style={{
-                        display: "block",
-                        fontSize: 12,
-                        opacity: 0.75,
-                        marginBottom: 6,
-                      }}
-                    >
+                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
                       Supporting Link
                     </label>
                     <input
@@ -799,24 +1266,16 @@ export default function App() {
                       </button>
                     </div>
 
-                    {saveMsg && (
-                      <div style={{ marginTop: 10, fontSize: 13 }}>
-                        {saveMsg}
-                      </div>
-                    )}
+                    {saveMsg && <div style={{ marginTop: 10, fontSize: 13 }}>{saveMsg}</div>}
                   </>
                 )}
-              </div>
-
-              <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-                Next: mainnet toggle + deploy + docs.
               </div>
             </div>
           )}
         </div>
       )}
 
-      {/* Treasury Ledger Tab */}
+      {/* Ledger Tab */}
       {tab === "Treasury Ledger" && (
         <div
           style={{
@@ -876,13 +1335,9 @@ export default function App() {
                       {shortSig(sig)}
                     </a>
 
-                    <div style={{ fontWeight: 900, color: labelColor(m.label) }}>
-                      {m.label}
-                    </div>
+                    <div style={{ fontWeight: 900, color: labelColor(m.label) }}>{m.label}</div>
 
-                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>
-                      {m.note ?? ""}
-                    </div>
+                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>{m.note ?? ""}</div>
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       {m.proofUrl && (
@@ -896,7 +1351,6 @@ export default function App() {
                         </a>
                       )}
 
-                      {/* Hide edit in Public View */}
                       {!isPublicView && (
                         <button
                           onClick={() => selectTx(sig, { goEditor: true })}
@@ -921,9 +1375,7 @@ export default function App() {
           </div>
 
           <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-            {isPublicView
-              ? "Public view is read-only."
-              : "Tip: Click “edit” to jump back into the editor."}
+            {isPublicView ? "Public view is read-only." : "Tip: Click “edit” to jump back into the editor."}
           </div>
         </div>
       )}
