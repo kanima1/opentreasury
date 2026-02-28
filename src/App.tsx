@@ -1,6 +1,3 @@
-/* src/App.tsx */
-
-// Polyfill Buffer for @solana/web3.js in browser builds
 import { Buffer } from "buffer";
 (window as any).Buffer = Buffer;
 
@@ -26,13 +23,13 @@ type LabelType = "Donation" | "Grant" | "Ops" | "Milestone" | "Other";
 
 type TxMeta = {
   label: LabelType;
-  note?: string; // Description (and stores Other detail via "Other: ...")
-  proofUrl?: string; // Supporting Link
+  note?: string;
+  proofUrl?: string;
 };
 
 type Tab = "Dashboard" | "Treasury Ledger";
 
-const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111";
+const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111"; // placeholder
 const MEMO_PROGRAM_ID = new PublicKey(
   "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 );
@@ -76,7 +73,6 @@ function labelColor(label: LabelType | "—") {
   }
 }
 
-// If note is like "Other: xyz", extract "xyz"
 function parseOtherDetail(note?: string) {
   if (!note) return "";
   const m = note.match(/^other:\s*(.*)$/i);
@@ -96,7 +92,6 @@ async function sha256Hex(input: string) {
 }
 
 function stableStringify(obj: any) {
-  // Deterministic JSON stringify (sort keys recursively)
   const seen = new WeakSet();
   const sorter = (x: any): any => {
     if (x && typeof x === "object") {
@@ -114,10 +109,9 @@ function stableStringify(obj: any) {
   return JSON.stringify(sorter(obj), null, 2);
 }
 
-type InjectedWalletProvider = {
+type WalletProvider = {
   publicKey?: PublicKey;
-  isPhantom?: boolean;
-  connect?: () => Promise<any>;
+  connect: () => Promise<any>;
   disconnect?: () => Promise<void>;
   signTransaction?: (tx: Transaction) => Promise<Transaction>;
   signAndSendTransaction?: (tx: Transaction) => Promise<{ signature: string }>;
@@ -146,7 +140,7 @@ export default function App() {
 
   const [searchLedger, setSearchLedger] = useState<string>("");
 
-  // Protocol proof state
+  // Proof state
   const [walletAddress, setWalletAddress] = useState<string>("");
   const [proofHash, setProofHash] = useState<string>("");
   const [proofJson, setProofJson] = useState<string>("");
@@ -160,13 +154,28 @@ export default function App() {
 
   const editorRef = useRef<HTMLDivElement | null>(null);
 
-  // Devnet connection (MVP)
   const connection = useMemo(
     () => new Connection("https://api.devnet.solana.com", "confirmed"),
     []
   );
 
-  // Load saved annotations when treasury changes
+  function getWalletProvider(): WalletProvider | null {
+    const w = window as any;
+    const provider = w?.solana;
+    if (!provider) return null;
+    return provider as WalletProvider;
+  }
+
+  function useMyWalletAsTreasury() {
+    if (!walletAddress) {
+      alert("Connect your wallet first.");
+      return;
+    }
+    setTreasury(walletAddress);
+    alert("Treasury set to your connected wallet ✅");
+  }
+
+  // Load saved annotations (per treasury)
   useEffect(() => {
     try {
       const raw = localStorage.getItem(storageKey(treasury));
@@ -174,6 +183,7 @@ export default function App() {
     } catch {
       setMeta({});
     }
+
     setSelectedSig(null);
     setSaveMsg("");
     setSearchLedger("");
@@ -184,7 +194,6 @@ export default function App() {
     setProofTxSig("");
     setProofMsg("");
 
-    // reset verification
     setVerifyTx("");
     setVerifyJson("");
     setVerifyMsg("");
@@ -236,7 +245,7 @@ export default function App() {
     };
   }, [treasury, connection]);
 
-  // Populate editor when tx is selected
+  // Populate editor
   useEffect(() => {
     if (!selectedSig) return;
 
@@ -348,7 +357,7 @@ export default function App() {
     alert("Public view link copied ✅");
   }
 
-  // ===== Protocol: OTMS + Proof =====
+  // ===== OTMS + Proof =====
   function buildOTMS() {
     return {
       version: 1,
@@ -371,60 +380,47 @@ export default function App() {
       const otms = buildOTMS();
       const json = stableStringify(otms);
       const hash = await sha256Hex(json);
+
       setProofJson(json);
       setProofHash(hash);
       setProofTxSig("");
       setProofMsg("Proof generated ✅");
 
-      // nice default: verification box pre-filled
-      setVerifyJson(json);
+      setVerifyJson(json); // helpful default
     } catch (e: any) {
       setProofMsg(e?.message ?? "Could not generate proof.");
     }
   }
 
-  function getInjectedWallet(): InjectedWalletProvider | null {
-    const w = window as any;
-    const provider = w?.solana;
-    if (!provider) return null;
-    return provider as InjectedWalletProvider;
-  }
-
   async function connectWallet() {
     try {
       setProofMsg("");
-      const provider = getInjectedWallet();
-      if (!provider || !provider.connect) {
+      const provider = getWalletProvider();
+      if (!provider) {
         setProofMsg(
-          "No injected wallet found. Install Phantom (or another wallet that injects window.solana)."
+          "No wallet provider found in browser. Install Phantom (or a wallet that injects window.solana)."
         );
         return;
       }
-
       const res = await provider.connect();
       const pubkey =
         res?.publicKey?.toString?.() ?? provider.publicKey?.toString?.();
-
       setWalletAddress(pubkey || "");
-      setProofMsg(pubkey ? "Wallet connected ✅" : "Connected, but could not read address.");
+      setProofMsg(
+        pubkey ? "Wallet connected ✅" : "Connected, but could not read address."
+      );
     } catch (e: any) {
-      setProofMsg(e?.message ?? "Could not connect wallet (check popup / permissions).");
+      setProofMsg(
+        e?.message ??
+          "Could not connect wallet (check wallet popup / permissions)."
+      );
     }
-  }
-
-  function useMyWalletAsTreasury() {
-    if (!walletAddress) {
-      alert("Connect your wallet first.");
-      return;
-    }
-    setTreasury(walletAddress);
-    alert("Treasury set to your connected wallet ✅");
   }
 
   async function anchorProofOnChain() {
     try {
       setProofMsg("");
-      const provider = getInjectedWallet();
+      const provider = getWalletProvider();
       if (!provider) {
         setProofMsg("Wallet provider not found.");
         return;
@@ -448,9 +444,7 @@ export default function App() {
       const ix = new TransactionInstruction({
         programId: MEMO_PROGRAM_ID,
         keys: [],
-        // web3.js d.ts sometimes expects Buffer, sometimes Uint8Array.
-        // Buffer works fine in browser as long as Buffer polyfill exists.
-        data: Buffer.from(memoText, "utf8") as any,
+        data: Buffer.from(memoText, "utf8") as any, // compatibility across web3.js versions
       });
 
       const tx = new Transaction().add(ix);
@@ -478,7 +472,7 @@ export default function App() {
       );
 
       setProofTxSig(sig);
-      setVerifyTx(sig); // auto fill verification input
+      setVerifyTx(sig);
       setProofMsg("Anchored on-chain ✅");
     } catch (e: any) {
       setProofMsg(e?.message ?? "Could not anchor proof on-chain.");
@@ -504,10 +498,13 @@ export default function App() {
     reader.onload = () => {
       try {
         const parsed = JSON.parse(String(reader.result));
-        // Backward compatible: accept {meta} or OTMS {entries}
+
         if (parsed?.meta && typeof parsed.meta === "object") {
           setMeta(parsed.meta);
-          localStorage.setItem(storageKey(treasury), JSON.stringify(parsed.meta));
+          localStorage.setItem(
+            storageKey(treasury),
+            JSON.stringify(parsed.meta)
+          );
           alert("Ledger imported ✅");
           return;
         }
@@ -537,35 +534,45 @@ export default function App() {
   }
 
   function decodeMemoTextFromTx(tx: any): string[] {
-    const lines: string[] = [];
+    const out: string[] = [];
     const msg = tx?.transaction?.message;
-    if (!msg) return lines;
+    if (!msg) return out;
 
-    const accountKeys: string[] =
-      msg.staticAccountKeys?.map((k: any) => k.toString?.() ?? String(k)) ??
-      msg.accountKeys?.map((k: any) => k.toString?.() ?? String(k)) ??
+    // Keys (versioned vs legacy)
+    const keys =
+      msg.staticAccountKeys ??
+      msg.accountKeys ??
+      msg.getAccountKeys?.().staticAccountKeys ??
+      msg.getAccountKeys?.().accountKeys ??
       [];
 
+    const accountKeys: string[] = Array.isArray(keys)
+      ? keys.map((k: any) => k?.toBase58?.() ?? k?.toString?.() ?? String(k))
+      : [];
+
     const instructions = msg.compiledInstructions ?? msg.instructions ?? [];
+
     for (const ix of instructions) {
-      // Versioned txs: compiledInstructions have programIdIndex + base58 data
-      const programIdIndex = ix.programIdIndex;
-      const programId = accountKeys[programIdIndex];
+      // compiled instruction path
+      const programIdIndex = ix?.programIdIndex;
+      const programId =
+        typeof programIdIndex === "number" ? accountKeys[programIdIndex] : undefined;
+
       if (programId !== MEMO_PROGRAM_ID.toBase58()) continue;
 
-      const dataB58 = ix.data;
-      if (!dataB58) continue;
+      const dataB58 = ix?.data;
+      if (!dataB58 || typeof dataB58 !== "string") continue;
 
       try {
         const bytes = bs58.decode(dataB58);
         const text = new TextDecoder().decode(bytes);
-        lines.push(text);
+        out.push(text);
       } catch {
         // ignore
       }
     }
 
-    return lines;
+    return out;
   }
 
   async function verifyProof() {
@@ -577,6 +584,7 @@ export default function App() {
         setVerifyMsg("❌ Paste a tx signature first.");
         return;
       }
+
       const jsonText = verifyJson.trim();
       if (!jsonText) {
         setVerifyMsg("❌ Paste OTMS JSON first.");
@@ -613,12 +621,11 @@ export default function App() {
       }
 
       const memo = memos[0];
-      const hashLine = memo
-        .split("\n")
-        .find((l) => l.toLowerCase().startsWith("hash:"));
-      const treasuryLine = memo
-        .split("\n")
-        .find((l) => l.toLowerCase().startsWith("treasury:"));
+      const lines = memo.split("\n");
+      const hashLine = lines.find((l) => l.toLowerCase().startsWith("hash:"));
+      const treasuryLine = lines.find((l) =>
+        l.toLowerCase().startsWith("treasury:")
+      );
 
       const memoHash = (hashLine ?? "").replace(/^hash:\s*/i, "").trim();
       const memoTreasury = (treasuryLine ?? "")
@@ -640,14 +647,12 @@ export default function App() {
       const jsonTreasury = String(parsed?.treasury ?? "").trim();
       if (jsonTreasury && memoTreasury && jsonTreasury !== memoTreasury) {
         setVerifyMsg(
-          `⚠️ Hash verified ✅ but treasury mismatch:\nJSON treasury: ${jsonTreasury}\nMemo treasury: ${memoTreasury}`
+          `⚠️ Hash verified ✅ but treasury mismatch:\nJSON treasury: ${jsonTreasury}\nMemo treasury: ${memoTreasury}\n\nMemo text:\n${memo}`
         );
         return;
       }
 
-      setVerifyMsg(
-        `✅ Verified!\nHash matches Memo.\n\nMemo text:\n${memo}`
-      );
+      setVerifyMsg(`✅ Verified!\nHash matches Memo.\n\nMemo text:\n${memo}`);
     } catch (e: any) {
       setVerifyMsg(e?.message ?? "❌ Verification failed unexpectedly.");
     }
@@ -694,7 +699,6 @@ export default function App() {
             Treasury Wallet Address
           </label>
 
-          {/* Input + Use My Wallet button */}
           <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
             <input
               value={treasury}
@@ -722,7 +726,9 @@ export default function App() {
                   padding: "10px 12px",
                   borderRadius: 10,
                   border: "1px solid rgba(0,0,0,0.15)",
-                  background: walletAddress ? "rgba(0,0,0,0.06)" : "rgba(0,0,0,0.12)",
+                  background: walletAddress
+                    ? "rgba(0,0,0,0.06)"
+                    : "rgba(0,0,0,0.12)",
                   fontWeight: 900,
                   cursor: walletAddress ? "pointer" : "not-allowed",
                   whiteSpace: "nowrap",
@@ -812,7 +818,7 @@ export default function App() {
         )}
       </div>
 
-      {/* Protocol Proof (private view only) */}
+      {/* Protocol Proof */}
       {!isPublicView && (
         <div
           style={{
@@ -1058,7 +1064,7 @@ export default function App() {
         </div>
       )}
 
-      {/* Dashboard Tab */}
+      {/* Dashboard */}
       {tab === "Dashboard" && (
         <div
           style={{
@@ -1166,7 +1172,9 @@ export default function App() {
                 ) : (
                   <>
                     <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
-                    <div style={{ fontWeight: 900, marginBottom: 14 }}>{shortSig(selectedSig)}</div>
+                    <div style={{ fontWeight: 900, marginBottom: 14 }}>
+                      {shortSig(selectedSig)}
+                    </div>
 
                     <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
                       Category
