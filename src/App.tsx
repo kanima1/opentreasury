@@ -1,7 +1,11 @@
+/* src/App.tsx */
+
+// Polyfill Buffer for @solana/web3.js in browser builds
 import { Buffer } from "buffer";
 (window as any).Buffer = Buffer;
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import bs58 from "bs58";
 import {
   Connection,
   PublicKey,
@@ -22,8 +26,8 @@ type LabelType = "Donation" | "Grant" | "Ops" | "Milestone" | "Other";
 
 type TxMeta = {
   label: LabelType;
-  note?: string;
-  proofUrl?: string;
+  note?: string; // Description (and stores Other detail via "Other: ...")
+  proofUrl?: string; // Supporting Link
 };
 
 type Tab = "Dashboard" | "Treasury Ledger";
@@ -72,6 +76,7 @@ function labelColor(label: LabelType | "—") {
   }
 }
 
+// If note is like "Other: xyz", extract "xyz"
 function parseOtherDetail(note?: string) {
   if (!note) return "";
   const m = note.match(/^other:\s*(.*)$/i);
@@ -109,9 +114,10 @@ function stableStringify(obj: any) {
   return JSON.stringify(sorter(obj), null, 2);
 }
 
-type WalletProvider = {
+type InjectedWalletProvider = {
   publicKey?: PublicKey;
-  connect: () => Promise<any>;
+  isPhantom?: boolean;
+  connect?: () => Promise<any>;
   disconnect?: () => Promise<void>;
   signTransaction?: (tx: Transaction) => Promise<Transaction>;
   signAndSendTransaction?: (tx: Transaction) => Promise<{ signature: string }>;
@@ -140,7 +146,7 @@ export default function App() {
 
   const [searchLedger, setSearchLedger] = useState<string>("");
 
-  // Proof state
+  // Protocol proof state
   const [walletAddress, setWalletAddress] = useState<string>("");
   const [proofHash, setProofHash] = useState<string>("");
   const [proofJson, setProofJson] = useState<string>("");
@@ -154,13 +160,13 @@ export default function App() {
 
   const editorRef = useRef<HTMLDivElement | null>(null);
 
-  // Devnet
+  // Devnet connection (MVP)
   const connection = useMemo(
     () => new Connection("https://api.devnet.solana.com", "confirmed"),
     []
   );
 
-  // Load saved annotations
+  // Load saved annotations when treasury changes
   useEffect(() => {
     try {
       const raw = localStorage.getItem(storageKey(treasury));
@@ -178,7 +184,7 @@ export default function App() {
     setProofTxSig("");
     setProofMsg("");
 
-    // reset verify
+    // reset verification
     setVerifyTx("");
     setVerifyJson("");
     setVerifyMsg("");
@@ -365,34 +371,32 @@ export default function App() {
       const otms = buildOTMS();
       const json = stableStringify(otms);
       const hash = await sha256Hex(json);
-
       setProofJson(json);
       setProofHash(hash);
       setProofTxSig("");
       setProofMsg("Proof generated ✅");
 
-      // helpful default for verification box
+      // nice default: verification box pre-filled
       setVerifyJson(json);
     } catch (e: any) {
       setProofMsg(e?.message ?? "Could not generate proof.");
     }
   }
 
-  function getWalletProvider(): WalletProvider | null {
+  function getInjectedWallet(): InjectedWalletProvider | null {
     const w = window as any;
     const provider = w?.solana;
     if (!provider) return null;
-    // MVP: any wallet that injects window.solana (Phantom does)
-    return provider as WalletProvider;
+    return provider as InjectedWalletProvider;
   }
 
   async function connectWallet() {
     try {
       setProofMsg("");
-      const provider = getWalletProvider();
-      if (!provider) {
+      const provider = getInjectedWallet();
+      if (!provider || !provider.connect) {
         setProofMsg(
-          "No wallet provider found in browser. Install Phantom (or a wallet that injects window.solana)."
+          "No injected wallet found. Install Phantom (or another wallet that injects window.solana)."
         );
         return;
       }
@@ -404,16 +408,23 @@ export default function App() {
       setWalletAddress(pubkey || "");
       setProofMsg(pubkey ? "Wallet connected ✅" : "Connected, but could not read address.");
     } catch (e: any) {
-      setProofMsg(
-        e?.message ?? "Could not connect wallet (check popup / permissions)."
-      );
+      setProofMsg(e?.message ?? "Could not connect wallet (check popup / permissions).");
     }
+  }
+
+  function useMyWalletAsTreasury() {
+    if (!walletAddress) {
+      alert("Connect your wallet first.");
+      return;
+    }
+    setTreasury(walletAddress);
+    alert("Treasury set to your connected wallet ✅");
   }
 
   async function anchorProofOnChain() {
     try {
       setProofMsg("");
-      const provider = getWalletProvider();
+      const provider = getInjectedWallet();
       if (!provider) {
         setProofMsg("Wallet provider not found.");
         return;
@@ -437,7 +448,8 @@ export default function App() {
       const ix = new TransactionInstruction({
         programId: MEMO_PROGRAM_ID,
         keys: [],
-        // web3.js types vary; Buffer works at runtime. Cast keeps TS happy.
+        // web3.js d.ts sometimes expects Buffer, sometimes Uint8Array.
+        // Buffer works fine in browser as long as Buffer polyfill exists.
         data: Buffer.from(memoText, "utf8") as any,
       });
 
@@ -466,111 +478,10 @@ export default function App() {
       );
 
       setProofTxSig(sig);
-      setVerifyTx(sig); // auto-fill for verification
+      setVerifyTx(sig); // auto fill verification input
       setProofMsg("Anchored on-chain ✅");
     } catch (e: any) {
       setProofMsg(e?.message ?? "Could not anchor proof on-chain.");
-    }
-  }
-
-  async function verifyProof() {
-    try {
-      setVerifyMsg("");
-
-      const sig = verifyTx.trim();
-      if (!sig) {
-        setVerifyMsg("❌ Paste a tx signature first.");
-        return;
-      }
-
-      const jsonText = verifyJson.trim();
-      if (!jsonText) {
-        setVerifyMsg("❌ Paste OTMS JSON first.");
-        return;
-      }
-
-      let parsedJson: any;
-      try {
-        parsedJson = JSON.parse(jsonText);
-      } catch {
-        setVerifyMsg("❌ OTMS JSON is not valid JSON.");
-        return;
-      }
-
-      // Compute hash from normalized JSON
-      const normalized = stableStringify(parsedJson);
-      const computedHash = await sha256Hex(normalized);
-
-      // ✅ Use parsed tx to reliably read Memo text (no manual base58 decoding)
-      const parsedTx = await connection.getParsedTransaction(sig, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
-
-      if (!parsedTx) {
-        setVerifyMsg("❌ Could not fetch that transaction (wrong cluster or signature?).");
-        return;
-      }
-
-      const ixs: any[] = (parsedTx.transaction?.message as any)?.instructions ?? [];
-      const memoIx = ixs.find((ix) => {
-        const pid =
-          typeof ix.programId === "string"
-            ? ix.programId
-            : ix.programId?.toString?.() ?? "";
-        return pid === MEMO_PROGRAM_ID.toBase58();
-      });
-
-      if (!memoIx) {
-        setVerifyMsg("❌ No Memo instruction found in this transaction.");
-        return;
-      }
-
-      // Memo program parsed output varies by RPC; cover common shapes
-      const memoText =
-        typeof memoIx.parsed === "string"
-          ? memoIx.parsed
-          : memoIx.parsed?.memo ?? memoIx.parsed ?? "";
-
-      if (!memoText || typeof memoText !== "string") {
-        setVerifyMsg("❌ Memo instruction found, but no readable memo text.");
-        return;
-      }
-
-      const hashLine = memoText
-        .split("\n")
-        .find((l) => l.toLowerCase().startsWith("hash:"));
-      const treasuryLine = memoText
-        .split("\n")
-        .find((l) => l.toLowerCase().startsWith("treasury:"));
-
-      const memoHash = (hashLine ?? "").replace(/^hash:\s*/i, "").trim();
-      const memoTreasury = (treasuryLine ?? "").replace(/^treasury:\s*/i, "").trim();
-
-      if (!memoHash) {
-        setVerifyMsg("❌ Memo found but could not read Hash line.");
-        return;
-      }
-
-      if (memoHash !== computedHash) {
-        setVerifyMsg(
-          `❌ Not verified.\nComputed hash: ${computedHash}\nMemo hash: ${memoHash}\n\nMemo text:\n${memoText}`
-        );
-        return;
-      }
-
-      // Optional treasury check
-      const jsonTreasury = String(parsedJson?.treasury ?? "").trim();
-      if (jsonTreasury && memoTreasury && jsonTreasury !== memoTreasury) {
-        setVerifyMsg(
-          `⚠️ Hash verified ✅ but treasury mismatch:\nJSON treasury: ${jsonTreasury}\nMemo treasury: ${memoTreasury}\n\nMemo text:\n${memoText}`
-        );
-        return;
-      }
-
-      setVerifyMsg(`✅ Verified!\nHash matches Memo.\n\nMemo text:\n${memoText}`);
-    } catch (e: any) {
-      setVerifyMsg(e?.message ?? "❌ Verification failed unexpectedly.");
     }
   }
 
@@ -593,7 +504,6 @@ export default function App() {
     reader.onload = () => {
       try {
         const parsed = JSON.parse(String(reader.result));
-
         // Backward compatible: accept {meta} or OTMS {entries}
         if (parsed?.meta && typeof parsed.meta === "object") {
           setMeta(parsed.meta);
@@ -624,6 +534,123 @@ export default function App() {
       }
     };
     reader.readAsText(file);
+  }
+
+  function decodeMemoTextFromTx(tx: any): string[] {
+    const lines: string[] = [];
+    const msg = tx?.transaction?.message;
+    if (!msg) return lines;
+
+    const accountKeys: string[] =
+      msg.staticAccountKeys?.map((k: any) => k.toString?.() ?? String(k)) ??
+      msg.accountKeys?.map((k: any) => k.toString?.() ?? String(k)) ??
+      [];
+
+    const instructions = msg.compiledInstructions ?? msg.instructions ?? [];
+    for (const ix of instructions) {
+      // Versioned txs: compiledInstructions have programIdIndex + base58 data
+      const programIdIndex = ix.programIdIndex;
+      const programId = accountKeys[programIdIndex];
+      if (programId !== MEMO_PROGRAM_ID.toBase58()) continue;
+
+      const dataB58 = ix.data;
+      if (!dataB58) continue;
+
+      try {
+        const bytes = bs58.decode(dataB58);
+        const text = new TextDecoder().decode(bytes);
+        lines.push(text);
+      } catch {
+        // ignore
+      }
+    }
+
+    return lines;
+  }
+
+  async function verifyProof() {
+    try {
+      setVerifyMsg("");
+
+      const sig = verifyTx.trim();
+      if (!sig) {
+        setVerifyMsg("❌ Paste a tx signature first.");
+        return;
+      }
+      const jsonText = verifyJson.trim();
+      if (!jsonText) {
+        setVerifyMsg("❌ Paste OTMS JSON first.");
+        return;
+      }
+
+      let parsed: any;
+      try {
+        parsed = JSON.parse(jsonText);
+      } catch {
+        setVerifyMsg("❌ OTMS JSON is not valid JSON.");
+        return;
+      }
+
+      const normalized = stableStringify(parsed);
+      const computedHash = await sha256Hex(normalized);
+
+      const tx = await connection.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+
+      if (!tx) {
+        setVerifyMsg(
+          "❌ Could not fetch that transaction on devnet (wrong cluster or signature?)."
+        );
+        return;
+      }
+
+      const memos = decodeMemoTextFromTx(tx);
+      if (memos.length === 0) {
+        setVerifyMsg("❌ No Memo instruction found in this transaction.");
+        return;
+      }
+
+      const memo = memos[0];
+      const hashLine = memo
+        .split("\n")
+        .find((l) => l.toLowerCase().startsWith("hash:"));
+      const treasuryLine = memo
+        .split("\n")
+        .find((l) => l.toLowerCase().startsWith("treasury:"));
+
+      const memoHash = (hashLine ?? "").replace(/^hash:\s*/i, "").trim();
+      const memoTreasury = (treasuryLine ?? "")
+        .replace(/^treasury:\s*/i, "")
+        .trim();
+
+      if (!memoHash) {
+        setVerifyMsg("❌ Memo found but could not read Hash line.");
+        return;
+      }
+
+      if (memoHash !== computedHash) {
+        setVerifyMsg(
+          `❌ Not verified.\nComputed hash: ${computedHash}\nMemo hash: ${memoHash}`
+        );
+        return;
+      }
+
+      const jsonTreasury = String(parsed?.treasury ?? "").trim();
+      if (jsonTreasury && memoTreasury && jsonTreasury !== memoTreasury) {
+        setVerifyMsg(
+          `⚠️ Hash verified ✅ but treasury mismatch:\nJSON treasury: ${jsonTreasury}\nMemo treasury: ${memoTreasury}`
+        );
+        return;
+      }
+
+      setVerifyMsg(
+        `✅ Verified!\nHash matches Memo.\n\nMemo text:\n${memo}`
+      );
+    } catch (e: any) {
+      setVerifyMsg(e?.message ?? "❌ Verification failed unexpectedly.");
+    }
   }
 
   return (
@@ -666,18 +693,45 @@ export default function App() {
           >
             Treasury Wallet Address
           </label>
-          <input
-            value={treasury}
-            onChange={(e) => setTreasury(e.target.value)}
-            placeholder="Enter Solana address…"
-            style={{
-              width: "100%",
-              padding: "10px 12px",
-              borderRadius: 10,
-              border: "1px solid rgba(0,0,0,0.18)",
-              outline: "none",
-            }}
-          />
+
+          {/* Input + Use My Wallet button */}
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            <input
+              value={treasury}
+              onChange={(e) => setTreasury(e.target.value)}
+              placeholder="Enter Solana address…"
+              style={{
+                width: "100%",
+                padding: "10px 12px",
+                borderRadius: 10,
+                border: "1px solid rgba(0,0,0,0.18)",
+                outline: "none",
+              }}
+            />
+
+            {!isPublicView && (
+              <button
+                onClick={useMyWalletAsTreasury}
+                disabled={!walletAddress}
+                title={
+                  walletAddress
+                    ? "Use your connected wallet as the treasury address"
+                    : "Connect your wallet first"
+                }
+                style={{
+                  padding: "10px 12px",
+                  borderRadius: 10,
+                  border: "1px solid rgba(0,0,0,0.15)",
+                  background: walletAddress ? "rgba(0,0,0,0.06)" : "rgba(0,0,0,0.12)",
+                  fontWeight: 900,
+                  cursor: walletAddress ? "pointer" : "not-allowed",
+                  whiteSpace: "nowrap",
+                }}
+              >
+                Use My Wallet
+              </button>
+            )}
+          </div>
         </div>
 
         <div style={{ minWidth: 180 }}>
@@ -769,14 +823,7 @@ export default function App() {
             background: "rgba(0,0,0,0.02)",
           }}
         >
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 10,
-              flexWrap: "wrap",
-            }}
-          >
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
             <div>
               <div style={{ fontSize: 14, fontWeight: 900 }}>Protocol Proof</div>
               <div style={{ fontSize: 12, opacity: 0.75 }}>
@@ -836,12 +883,7 @@ export default function App() {
 
           <div style={{ marginTop: 10, fontSize: 13 }}>
             <div style={{ opacity: 0.75 }}>Current Proof Hash</div>
-            <div
-              style={{
-                fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                wordBreak: "break-all",
-              }}
-            >
+            <div style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", wordBreak: "break-all" }}>
               {proofHash || "—"}
             </div>
 
@@ -884,13 +926,7 @@ export default function App() {
           </div>
 
           {/* Proof Verification */}
-          <div
-            style={{
-              marginTop: 14,
-              borderTop: "1px solid rgba(0,0,0,0.08)",
-              paddingTop: 12,
-            }}
-          >
+          <div style={{ marginTop: 14, borderTop: "1px solid rgba(0,0,0,0.08)", paddingTop: 12 }}>
             <div style={{ fontSize: 14, fontWeight: 900 }}>Proof Verification</div>
             <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
               Paste the on-chain tx signature + the OTMS JSON, then verify the hash matches the Memo.
@@ -947,11 +983,7 @@ export default function App() {
                     href={`https://explorer.solana.com/tx/${verifyTx.trim()}?cluster=devnet`}
                     target="_blank"
                     rel="noreferrer"
-                    style={{
-                      alignSelf: "center",
-                      fontWeight: 900,
-                      textDecoration: "none",
-                    }}
+                    style={{ alignSelf: "center", fontWeight: 900, textDecoration: "none" }}
                   >
                     Open Tx in Explorer →
                   </a>
@@ -1048,13 +1080,7 @@ export default function App() {
                 borderRadius: 12,
               }}
             >
-              <table
-                style={{
-                  width: "100%",
-                  borderCollapse: "collapse",
-                  fontSize: 13,
-                }}
-              >
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
                 <thead style={{ background: "rgba(0,0,0,0.03)" }}>
                   <tr>
                     <th style={{ textAlign: "left", padding: 10 }}>Signature</th>
@@ -1086,9 +1112,7 @@ export default function App() {
                           style={{
                             cursor: isPublicView ? "default" : "pointer",
                             borderTop: "1px solid rgba(0,0,0,0.08)",
-                            background: isSelected
-                              ? "rgba(0,0,0,0.04)"
-                              : "transparent",
+                            background: isSelected ? "rgba(0,0,0,0.04)" : "transparent",
                           }}
                         >
                           <td style={{ padding: 10 }}>
@@ -1109,13 +1133,9 @@ export default function App() {
                           </td>
                           <td style={{ padding: 10 }}>
                             {t.err ? (
-                              <span style={{ color: "#dc2626", fontWeight: 800 }}>
-                                Failed
-                              </span>
+                              <span style={{ color: "#dc2626", fontWeight: 800 }}>Failed</span>
                             ) : (
-                              <span style={{ color: "#16a34a", fontWeight: 800 }}>
-                                Confirmed
-                              </span>
+                              <span style={{ color: "#16a34a", fontWeight: 800 }}>Confirmed</span>
                             )}
                           </td>
                         </tr>
@@ -1138,13 +1158,7 @@ export default function App() {
                 Transaction Annotation
               </h2>
 
-              <div
-                style={{
-                  border: "1px solid rgba(0,0,0,0.12)",
-                  borderRadius: 12,
-                  padding: 12,
-                }}
-              >
+              <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
                 {!selectedSig ? (
                   <div style={{ opacity: 0.75, fontSize: 13 }}>
                     Select a transaction to add context and supporting evidence.
@@ -1152,9 +1166,7 @@ export default function App() {
                 ) : (
                   <>
                     <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
-                    <div style={{ fontWeight: 900, marginBottom: 14 }}>
-                      {shortSig(selectedSig)}
-                    </div>
+                    <div style={{ fontWeight: 900, marginBottom: 14 }}>{shortSig(selectedSig)}</div>
 
                     <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
                       Category
@@ -1277,22 +1289,8 @@ export default function App() {
 
       {/* Ledger Tab */}
       {tab === "Treasury Ledger" && (
-        <div
-          style={{
-            marginTop: 18,
-            border: "1px solid rgba(0,0,0,0.12)",
-            borderRadius: 12,
-            padding: 12,
-          }}
-        >
-          <div
-            style={{
-              display: "flex",
-              justifyContent: "space-between",
-              gap: 10,
-              flexWrap: "wrap",
-            }}
-          >
+        <div style={{ marginTop: 18, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
             <div style={{ fontSize: 16, fontWeight: 900 }}>Treasury Ledger</div>
             <input
               value={searchLedger}
@@ -1341,12 +1339,7 @@ export default function App() {
 
                     <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
                       {m.proofUrl && (
-                        <a
-                          href={m.proofUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          style={{ textDecoration: "none" }}
-                        >
+                        <a href={m.proofUrl} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
                           link
                         </a>
                       )}
