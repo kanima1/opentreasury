@@ -1,7 +1,7 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { Buffer } from "buffer";
 (window as any).Buffer = Buffer;
 
-import { useEffect, useMemo, useRef, useState } from "react";
 import bs58 from "bs58";
 import {
   Connection,
@@ -27,12 +27,83 @@ type TxMeta = {
   proofUrl?: string;
 };
 
-type Tab = "Dashboard" | "Treasury Ledger";
+type ViewKey = "dashboard" | "ledger" | "proof" | "verify" | "settings";
+type ClusterKey = "devnet" | "testnet" | "mainnet-beta";
 
-const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111"; // placeholder
+type Settings = {
+  theme: "dark" | "light";
+  language: Language;
+  currency: Currency;
+  network: ClusterKey;
+  hideBalance: boolean;
+};
+
+type PhantomProvider = {
+  isPhantom?: boolean;
+  publicKey?: PublicKey;
+  connect: () => Promise<any>;
+  disconnect?: () => Promise<void>;
+  signTransaction?: (tx: Transaction) => Promise<Transaction>;
+  signAndSendTransaction?: (tx: Transaction) => Promise<{ signature: string }>;
+};
+
 const MEMO_PROGRAM_ID = new PublicKey(
   "MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr"
 );
+
+// Use your real treasury as default if you want:
+// const DEFAULT_TREASURY = "3wQkzvarKeeeVSteQbgzL7BenYhfvyJ3u3WpzPDEhuWk";
+const DEFAULT_TREASURY = "Vote111111111111111111111111111111111111111";
+
+const LANGUAGE_OPTIONS = [
+  "English",
+  "Spanish",
+  "French",
+  "Arabic",
+  "Portuguese",
+  "Russian",
+  "German",
+  "Japanese",
+  "Korean",
+  "Italian",
+  "Turkish",
+  "Hindi",
+  "Bengali",
+  "Urdu",
+  "Punjabi",
+  "Vietnamese",
+  "Thai",
+  "Indonesian",
+  "Swahili",
+  "Mandarin Chinese",
+] as const;
+
+type Language = (typeof LANGUAGE_OPTIONS)[number];
+
+const CURRENCY_OPTIONS = [
+  "USD", // US Dollar
+  "EUR", // Euro
+  "GBP", // British Pound
+  "JPY", // Japanese Yen
+  "CNY", // Chinese Yuan
+  "CHF", // Swiss Franc
+  "CAD", // Canadian Dollar
+  "AUD", // Australian Dollar
+  "NZD", // New Zealand Dollar
+  "SGD", // Singapore Dollar
+  "HKD", // Hong Kong Dollar
+  "INR", // Indian Rupee
+  "BRL", // Brazilian Real
+  "ZAR", // South African Rand
+  "NGN", // Nigerian Naira
+  "KES", // Kenyan Shilling
+  "GHS", // Ghanaian Cedi
+  "AED", // UAE Dirham
+  "SAR", // Saudi Riyal
+  "TRY", // Turkish Lira
+] as const;
+
+type Currency = (typeof CURRENCY_OPTIONS)[number];
 
 function shortSig(sig: string) {
   return sig.slice(0, 6) + "…" + sig.slice(-6);
@@ -56,20 +127,24 @@ function storageKey(treasury: string) {
   return `opentreasury:labels:${treasury.trim()}`;
 }
 
+function settingsKey() {
+  return `opentreasury:settings:v2`;
+}
+
 function labelColor(label: LabelType | "—") {
   switch (label) {
     case "Donation":
-      return "#16a34a";
+      return "#34d399";
     case "Grant":
-      return "#2563eb";
+      return "#60a5fa";
     case "Ops":
-      return "#f59e0b";
+      return "#fbbf24";
     case "Milestone":
-      return "#9333ea";
+      return "#c084fc";
     case "Other":
-      return "#64748b";
+      return "#94a3b8";
     default:
-      return "#111";
+      return "#e5e7eb";
   }
 }
 
@@ -109,36 +184,658 @@ function stableStringify(obj: any) {
   return JSON.stringify(sorter(obj), null, 2);
 }
 
-type WalletProvider = {
-  publicKey?: PublicKey;
-  connect: () => Promise<any>;
-  disconnect?: () => Promise<void>;
-  signTransaction?: (tx: Transaction) => Promise<Transaction>;
-  signAndSendTransaction?: (tx: Transaction) => Promise<{ signature: string }>;
+function clusterRpc(cluster: ClusterKey) {
+  if (cluster === "mainnet-beta") return "https://solana-mainnet.g.alchemy.com/v2/demo";
+  if (cluster === "testnet") return "https://api.testnet.solana.com";
+  return "https://api.devnet.solana.com";
+}
+
+function explorerTxUrl(sig: string, cluster: ClusterKey) {
+  return `https://explorer.solana.com/tx/${sig}?cluster=${cluster}`;
+}
+
+function explorerAddrUrl(addr: string, cluster: ClusterKey) {
+  return `https://explorer.solana.com/address/${addr}?cluster=${cluster}`;
+}
+
+function clamp(s: string, max: number) {
+  return s.length <= max ? s : s.slice(0, max - 1) + "…";
+}
+
+function findAccountIndexInTx(tx: any, pubkeyBase58: string): number {
+  const msg = tx?.transaction?.message;
+  if (!msg) return -1;
+
+  const keys =
+    msg.staticAccountKeys ??
+    msg.accountKeys ??
+    [];
+
+  for (let i = 0; i < keys.length; i++) {
+    const k = keys[i];
+    const s =
+      typeof k === "string"
+        ? k
+        : k?.toBase58?.()
+        ? k.toBase58()
+        : k?.pubkey?.toString?.()
+        ? k.pubkey.toString()
+        : k?.pubkey
+        ? String(k.pubkey)
+        : k?.toString?.()
+        ? k.toString()
+        : "";
+
+    if (s === pubkeyBase58) return i;
+  }
+  return -1;
+}
+
+function formatSolDelta(v: number) {
+  const sign = v > 0 ? "+" : "";
+  return `${sign}${v.toFixed(4)} SOL`;
+}
+
+/** ---------- Minimal Icon Set (inline SVG) ---------- */
+function Icon({
+  children,
+  size = 22, // default icon size inside tiles
+}: {
+  children: React.ReactNode;
+  size?: number;
+}) {
+  return (
+    <span
+      style={{
+        width: size,
+        height: size,
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        lineHeight: 0,
+      }}
+    >
+      {/* Force SVG to fully fill icon box */}
+      <span
+        style={{
+          width: "100%",
+          height: "100%",
+          display: "block",
+        }}
+      >
+        {children}
+      </span>
+    </span>
+  );
+}
+
+const Icons = {
+  Dashboard: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M4 13h7V4H4v9Zm9 7h7V11h-7v9ZM4 20h7v-5H4v5Zm9-9h7V4h-7v7Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Ledger: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M7 7h10M7 11h10M7 15h7"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M6 3h12a2 2 0 0 1 2 2v14l-3-2-3 2-3-2-3 2-3-2V5a2 2 0 0 1 2-2Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Proof: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M12 3l7 4v6c0 5-3 8-7 8s-7-3-7-8V7l7-4Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M9 12l2 2 4-5"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Verify: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24"
+       fill="none"
+        style={{ width: "100%", height: "100%", display: "block" }}
+       >
+        <path
+          d="M10 13a4 4 0 1 1 2 2"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M12 14v6"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M9 20h6"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Settings: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24"
+       fill="none"
+        style={{ width: "100%", height: "100%", display: "block" }}
+       >
+        <path
+          d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M19.4 15a7.9 7.9 0 0 0 .1-2l2-1.2-2-3.4-2.3.6a7.7 7.7 0 0 0-1.7-1l-.3-2.3H9.8L9.5 7a7.7 7.7 0 0 0-1.7 1l-2.3-.6-2 3.4 2 1.2a7.9 7.9 0 0 0 .1 2l-2 1.2 2 3.4 2.3-.6c.5.4 1.1.7 1.7 1l.3 2.3h4.4l.3-2.3c.6-.3 1.2-.6 1.7-1l2.3.6 2-3.4-2-1.2Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Search: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24"
+       fill="none"
+        style={{ width: "100%", height: "100%", display: "block" }}
+       >
+        <path
+          d="M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M16.5 16.5 21 21"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Share: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24"
+       fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+       >
+        <path
+          d="M15 8a3 3 0 1 0-2.8-4"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M6 14a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M18 10a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M8.5 15.5 15.5 13"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M8.5 18 15.5 20.5"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Download: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24"
+       fill="none"
+        style={{ width: "100%", height: "100%", display: "block" }}
+       >
+        <path
+          d="M12 3v10"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M8 11l4 4 4-4"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M4 20h16"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Upload: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24"
+       fill="none"
+        style={{ width: "100%", height: "100%", display: "block" }}
+       >
+        <path
+          d="M12 21V11"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M8 14l4-4 4 4"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M4 4h16"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Link: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M10 13a5 5 0 0 1 0-7l1-1a5 5 0 0 1 7 7l-1 1"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M14 11a5 5 0 0 1 0 7l-1 1a5 5 0 0 1-7-7l1-1"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Moon: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M21 13.5A8.5 8.5 0 0 1 10.5 3a7 7 0 1 0 10.5 10.5Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Sun: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M12 18a6 6 0 1 0 0-12 6 6 0 0 0 0 12Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M12 2v2M12 20v2M4 12H2M22 12h-2M5 5l1.5 1.5M17.5 17.5 19 19M19 5l-1.5 1.5M5 19l1.5-1.5"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Wallet: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M4 7h15a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V7Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M4 7V6a2 2 0 0 1 2-2h13"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M17 12h4v4h-4a2 2 0 0 1 0-4Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Hash: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M9 3 7 21M17 3l-2 18M4 8h18M3 16h18"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
+  Eye: (p: { size?: number }) => (
+  <Icon size={p.size}>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ width: "100%", height: "100%", display: "block" }}
+    >
+      <path
+        d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinejoin="round"
+      />
+      <circle
+        cx="12"
+        cy="12"
+        r="3"
+        stroke="currentColor"
+        strokeWidth="2"
+      />
+    </svg>
+  </Icon>
+),
+
+EyeOff: (p: { size?: number }) => (
+  <Icon size={p.size}>
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      style={{ width: "100%", height: "100%", display: "block" }}
+    >
+      <path
+        d="M3 3l18 18"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      <path
+        d="M10.6 10.7A3 3 0 0 0 13.3 13.4"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+      />
+      <path
+        d="M9.9 5.1A12.5 12.5 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+      <path
+        d="M6.2 6.3A17.3 17.3 0 0 0 2 12s3.5 7 10 7c1.7 0 3.2-.4 4.5-1"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      />
+    </svg>
+  </Icon>
+),
+  Anchor: (p: { size?: number }) => (
+    <Icon size={p.size}>
+      <svg viewBox="0 0 24 24" 
+      fill="none"
+       style={{ width: "100%", height: "100%", display: "block" }}
+      >
+        <path
+          d="M12 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6Z"
+          stroke="currentColor"
+          strokeWidth="2"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M12 9v12"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M5 13c0 4 3 8 7 8s7-4 7-8"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+        <path
+          d="M4 13h6M14 13h6"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          vectorEffect="non-scaling-stroke"
+        />
+      </svg>
+    </Icon>
+  ),
 };
 
-export default function App() {
+/** Icon tile button (uniform sizing) */
+function ToolIconButton({
+  label,
+  onClick,
+  active,
+  disabled,
+  children,
+}: {
+  label: string;
+  onClick?: () => void;
+  active?: boolean;
+  disabled?: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      onClick={disabled ? undefined : onClick}
+      title={label}
+      disabled={disabled}
+      style={{
+        width: 44,
+        height: 44,
+        padding: 0,
+        borderRadius: 14,
+        border: `1px solid var(--ot-border)`,
+        background: active ? "var(--ot-btn-active)" : "var(--ot-btn-bg)",
+        color: "inherit",
+        display: "inline-flex",
+        alignItems: "center",
+        justifyContent: "center",
+        lineHeight: 0,
+        cursor: disabled ? "not-allowed" : "pointer",
+        opacity: disabled ? 0.6 : 1,
+        transition: "transform .12s ease, background .12s ease, border-color .12s ease",
+        // subtle “Solflare-like” presence:
+        boxShadow: active ? "0 6px 18px rgba(0,0,0,0.18)" : "none",
+      }}
+      onMouseDown={(e) => {
+        if (!disabled) e.currentTarget.style.transform = "scale(0.98)";
+      }}
+      onMouseUp={(e) => {
+        e.currentTarget.style.transform = "scale(1)";
+      }}
+    >
+      {/* THIS is what makes it optically bigger */}
+      <span style={{ transform: "translateY(0.25px)" }}>{children}</span>
+    </button>
+  );
+}export default function App() {
   const searchParams = new URLSearchParams(window.location.search);
   const isPublicView = searchParams.get("view") === "public";
 
-  const [tab, setTab] = useState<Tab>("Dashboard");
+  const [view, setView] = useState<ViewKey>("dashboard");
+
+  const [settings, setSettings] = useState<Settings>(() => {
+    try {
+      const raw = localStorage.getItem(settingsKey());
+      if (raw) return JSON.parse(raw);
+    } catch {}
+    return {
+      theme: "dark",
+      language: "English",
+      currency: "USD",
+      network: "devnet",
+      hideBalance: false,
+    };
+  });
+
+  useEffect(() => {
+    localStorage.setItem(settingsKey(), JSON.stringify(settings));
+    document.documentElement.setAttribute("data-theme", settings.theme);
+  }, [settings]);
 
   const [treasury, setTreasury] = useState<string>(DEFAULT_TREASURY);
   const [status, setStatus] = useState<string>("");
   const [balanceSol, setBalanceSol] = useState<number | null>(null);
   const [txs, setTxs] = useState<TxRow[]>([]);
   const [error, setError] = useState<string>("");
+  const [txDeltaSol, setTxDeltaSol] = useState<Record<string, number>>({});
+  const [txDeltaLoading, setTxDeltaLoading] = useState<Record<string, boolean>>({});
 
   const [meta, setMeta] = useState<Record<string, TxMeta>>({});
   const [selectedSig, setSelectedSig] = useState<string | null>(null);
-
   const [editLabel, setEditLabel] = useState<LabelType>("Donation");
   const [editOtherDetail, setEditOtherDetail] = useState<string>("");
   const [editNote, setEditNote] = useState<string>("");
   const [editProof, setEditProof] = useState<string>("");
   const [saveMsg, setSaveMsg] = useState<string>("");
-
-  const [searchLedger, setSearchLedger] = useState<string>("");
+ 
+  // Global search
+  const [globalSearch, setGlobalSearch] = useState<string>("");
 
   // Proof state
   const [walletAddress, setWalletAddress] = useState<string>("");
@@ -155,40 +852,30 @@ export default function App() {
   const editorRef = useRef<HTMLDivElement | null>(null);
 
   const connection = useMemo(
-    () => new Connection("https://api.devnet.solana.com", "confirmed"),
-    []
+    () => new Connection(clusterRpc(settings.network), "confirmed"),
+    [settings.network]
   );
 
-  function getWalletProvider(): WalletProvider | null {
+  function getWalletProvider(): PhantomProvider | null {
     const w = window as any;
     const provider = w?.solana;
     if (!provider) return null;
-    return provider as WalletProvider;
+    return provider as PhantomProvider;
   }
 
-  function useMyWalletAsTreasury() {
-    if (!walletAddress) {
-      alert("Connect your wallet first.");
-      return;
-    }
-    setTreasury(walletAddress);
-    alert("Treasury set to your connected wallet ✅");
-  }
-
-  // Load saved annotations (per treasury)
+  // Load saved annotations per treasury + network (separate per cluster)
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(storageKey(treasury));
+      const raw = localStorage.getItem(
+        storageKey(`${settings.network}:${treasury}`)
+      );
       setMeta(raw ? JSON.parse(raw) : {});
     } catch {
       setMeta({});
     }
-
     setSelectedSig(null);
     setSaveMsg("");
-    setSearchLedger("");
 
-    // reset proof (treasury changed)
     setProofHash("");
     setProofJson("");
     setProofTxSig("");
@@ -197,7 +884,9 @@ export default function App() {
     setVerifyTx("");
     setVerifyJson("");
     setVerifyMsg("");
-  }, [treasury]);
+    setTxDeltaSol({});
+    setTxDeltaLoading({}); 
+  }, [treasury, settings.network]);
 
   // Fetch balance + txs
   useEffect(() => {
@@ -235,7 +924,10 @@ export default function App() {
         setStatus("Loaded ✅");
       } catch (e: any) {
         setStatus("");
-        setError(e?.message ?? "Something went wrong");
+        setBalanceSol(null);
+        setError(
+          "could not connect to the selected Solana network RPC. Check your internet or switch network."
+        );
       }
     }
 
@@ -244,8 +936,67 @@ export default function App() {
       cancelled = true;
     };
   }, [treasury, connection]);
+useEffect(() => {
+  let cancelled = false;
 
-  // Populate editor
+  async function loadDeltas() {
+    const addr = treasury.trim();
+    if (!addr || txs.length === 0) return;
+
+    const sigsToFetch = txs
+      .map((t) => t.signature)
+      .filter((sig) => txDeltaSol[sig] === undefined);
+
+    if (sigsToFetch.length === 0) return;
+
+    setTxDeltaLoading((m) => {
+      const next = { ...m };
+      for (const sig of sigsToFetch) next[sig] = true;
+      return next;
+    });
+
+    for (const sig of sigsToFetch) {
+      if (cancelled) return;
+
+      try {
+        const tx =
+          (await connection.getTransaction(sig, {
+            commitment: "confirmed",
+            maxSupportedTransactionVersion: 0,
+          })) ??
+          (await connection.getTransaction(sig, {
+            commitment: "confirmed",
+            maxSupportedTransactionVersion: 1,
+          }));
+
+        if (!tx) continue;
+
+        const idx = findAccountIndexInTx(tx, addr);
+        if (idx < 0) continue;
+
+        const pre = tx?.meta?.preBalances?.[idx];
+        const post = tx?.meta?.postBalances?.[idx];
+
+        if (typeof pre !== "number" || typeof post !== "number") continue;
+
+        const delta = (post - pre) / LAMPORTS_PER_SOL;
+
+        setTxDeltaSol((m) => ({ ...m, [sig]: delta }));
+      } catch {
+        // ignore
+      } finally {
+        setTxDeltaLoading((m) => ({ ...m, [sig]: false }));
+      }
+    }
+  }
+
+  loadDeltas();
+
+  return () => {
+    cancelled = true;
+  };
+}, [treasury, txs, connection]);
+  // Populate editor when tx is selected
   useEffect(() => {
     if (!selectedSig) return;
 
@@ -281,17 +1032,6 @@ export default function App() {
     editorRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
   }
 
-  function selectTx(sig: string, opts?: { goEditor?: boolean }) {
-    if (isPublicView) return;
-    setSelectedSig(sig);
-    if (opts?.goEditor) {
-      setTimeout(() => {
-        setTab("Dashboard");
-        setTimeout(scrollToEditor, 50);
-      }, 0);
-    }
-  }
-
   function saveMeta() {
     if (!selectedSig || isPublicView) return;
 
@@ -305,7 +1045,6 @@ export default function App() {
     const other = editOtherDetail.trim();
 
     let finalNote: string | undefined;
-
     if (editLabel === "Other") {
       const base = other ? `Other: ${other}` : "Other";
       finalNote = desc ? `${base} | ${desc}` : other ? base : undefined;
@@ -323,7 +1062,10 @@ export default function App() {
     };
 
     setMeta(next);
-    localStorage.setItem(storageKey(treasury), JSON.stringify(next));
+    localStorage.setItem(
+      storageKey(`${settings.network}:${treasury}`),
+      JSON.stringify(next)
+    );
     setSaveMsg("Saved ✅");
   }
 
@@ -333,36 +1075,18 @@ export default function App() {
     const next = { ...meta };
     delete next[selectedSig];
     setMeta(next);
-    localStorage.setItem(storageKey(treasury), JSON.stringify(next));
+    localStorage.setItem(
+      storageKey(`${settings.network}:${treasury}`),
+      JSON.stringify(next)
+    );
     setSaveMsg("Removed ✅");
   }
 
-  const ledgerEntries = Object.keys(meta).length;
-
-  const ledgerRows = Object.entries(meta).filter(([sig, m]) => {
-    const q = searchLedger.trim().toLowerCase();
-    if (!q) return true;
-    return (
-      sig.toLowerCase().includes(q) ||
-      m.label.toLowerCase().includes(q) ||
-      (m.note ?? "").toLowerCase().includes(q) ||
-      (m.proofUrl ?? "").toLowerCase().includes(q)
-    );
-  });
-
-  function copyPublicLink() {
-    const url = new URL(window.location.href);
-    url.searchParams.set("view", "public");
-    navigator.clipboard.writeText(url.toString());
-    alert("Public view link copied ✅");
-  }
-
-  // ===== OTMS + Proof =====
   function buildOTMS() {
     return {
       version: 1,
       standard: "OTMS",
-      cluster: "devnet",
+      cluster: settings.network,
       treasury: treasury.trim(),
       exportedAt: new Date().toISOString(),
       entries: Object.entries(meta).map(([signature, m]) => ({
@@ -386,7 +1110,8 @@ export default function App() {
       setProofTxSig("");
       setProofMsg("Proof generated ✅");
 
-      setVerifyJson(json); // helpful default
+      setVerifyJson(json);
+      setView("proof");
     } catch (e: any) {
       setProofMsg(e?.message ?? "Could not generate proof.");
     }
@@ -398,7 +1123,7 @@ export default function App() {
       const provider = getWalletProvider();
       if (!provider) {
         setProofMsg(
-          "No wallet provider found in browser. Install Phantom (or a wallet that injects window.solana)."
+          "No wallet provider found. Install Phantom (or a wallet that injects window.solana)."
         );
         return;
       }
@@ -411,10 +1136,18 @@ export default function App() {
       );
     } catch (e: any) {
       setProofMsg(
-        e?.message ??
-          "Could not connect wallet (check wallet popup / permissions)."
+        e?.message ?? "Could not connect wallet (check popup/permissions)."
       );
     }
+  }
+
+  function useWalletAsTreasury() {
+    if (!walletAddress) {
+      setProofMsg("Connect wallet first, then you can use it as treasury.");
+      return;
+    }
+    setTreasury(walletAddress);
+    setProofMsg("Treasury set to connected wallet ✅");
   }
 
   async function anchorProofOnChain() {
@@ -444,7 +1177,7 @@ export default function App() {
       const ix = new TransactionInstruction({
         programId: MEMO_PROGRAM_ID,
         keys: [],
-        data: Buffer.from(memoText, "utf8") as any, // compatibility across web3.js versions
+        data: Buffer.from(memoText, "utf8") as any,
       });
 
       const tx = new Transaction().add(ix);
@@ -474,6 +1207,7 @@ export default function App() {
       setProofTxSig(sig);
       setVerifyTx(sig);
       setProofMsg("Anchored on-chain ✅");
+      setView("verify");
     } catch (e: any) {
       setProofMsg(e?.message ?? "Could not anchor proof on-chain.");
     }
@@ -487,7 +1221,9 @@ export default function App() {
 
     const a = document.createElement("a");
     a.href = url;
-    a.download = `opentreasury-otms-${treasury.trim().slice(0, 6)}.json`;
+    a.download = `opentreasury-otms-${settings.network}-${treasury
+      .trim()
+      .slice(0, 6)}.json`;
     a.click();
 
     URL.revokeObjectURL(url);
@@ -502,7 +1238,7 @@ export default function App() {
         if (parsed?.meta && typeof parsed.meta === "object") {
           setMeta(parsed.meta);
           localStorage.setItem(
-            storageKey(treasury),
+            storageKey(`${settings.network}:${treasury}`),
             JSON.stringify(parsed.meta)
           );
           alert("Ledger imported ✅");
@@ -520,7 +1256,10 @@ export default function App() {
             };
           }
           setMeta(next);
-          localStorage.setItem(storageKey(treasury), JSON.stringify(next));
+          localStorage.setItem(
+            storageKey(`${settings.network}:${treasury}`),
+            JSON.stringify(next)
+          );
           alert("OTMS imported ✅");
           return;
         }
@@ -534,45 +1273,40 @@ export default function App() {
   }
 
   function decodeMemoTextFromTx(tx: any): string[] {
-    const out: string[] = [];
-    const msg = tx?.transaction?.message;
-    if (!msg) return out;
+    const lines: string[] = [];
+    if (!tx?.transaction?.message) return lines;
 
-    // Keys (versioned vs legacy)
-    const keys =
-      msg.staticAccountKeys ??
-      msg.accountKeys ??
-      msg.getAccountKeys?.().staticAccountKeys ??
-      msg.getAccountKeys?.().accountKeys ??
-      [];
+    const message = tx.transaction.message;
 
-    const accountKeys: string[] = Array.isArray(keys)
-      ? keys.map((k: any) => k?.toBase58?.() ?? k?.toString?.() ?? String(k))
-      : [];
+    const accountKeys = message.staticAccountKeys ?? message.accountKeys ?? [];
+    const compiledInstructions =
+      message.compiledInstructions ?? message.instructions ?? [];
 
-    const instructions = msg.compiledInstructions ?? msg.instructions ?? [];
+    for (const ix of compiledInstructions) {
+      let programId: string | undefined;
 
-    for (const ix of instructions) {
-      // compiled instruction path
-      const programIdIndex = ix?.programIdIndex;
-      const programId =
-        typeof programIdIndex === "number" ? accountKeys[programIdIndex] : undefined;
+      if (typeof ix.programIdIndex === "number") {
+        const key = accountKeys[ix.programIdIndex];
+        programId = typeof key === "string" ? key : key?.toString?.();
+      } else if (ix.programId) {
+        programId = ix.programId.toString?.();
+      }
 
       if (programId !== MEMO_PROGRAM_ID.toBase58()) continue;
 
-      const dataB58 = ix?.data;
-      if (!dataB58 || typeof dataB58 !== "string") continue;
+      const dataBase58 = ix.data;
+      if (!dataBase58) continue;
 
       try {
-        const bytes = bs58.decode(dataB58);
-        const text = new TextDecoder().decode(bytes);
-        out.push(text);
+        const decoded = bs58.decode(dataBase58);
+        const text = new TextDecoder().decode(decoded);
+        lines.push(text);
       } catch {
         // ignore
       }
     }
 
-    return out;
+    return lines;
   }
 
   async function verifyProof() {
@@ -584,7 +1318,6 @@ export default function App() {
         setVerifyMsg("❌ Paste a tx signature first.");
         return;
       }
-
       const jsonText = verifyJson.trim();
       if (!jsonText) {
         setVerifyMsg("❌ Paste OTMS JSON first.");
@@ -602,14 +1335,20 @@ export default function App() {
       const normalized = stableStringify(parsed);
       const computedHash = await sha256Hex(normalized);
 
-      const tx = await connection.getTransaction(sig, {
-        commitment: "confirmed",
-        maxSupportedTransactionVersion: 0,
-      });
+      let tx: any = null;
+      tx =
+        (await connection.getTransaction(sig, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 0,
+        })) ??
+        (await connection.getTransaction(sig, {
+          commitment: "confirmed",
+          maxSupportedTransactionVersion: 1,
+        }));
 
       if (!tx) {
         setVerifyMsg(
-          "❌ Could not fetch that transaction on devnet (wrong cluster or signature?)."
+          `❌ Could not fetch transaction on ${settings.network}.\nCheck signature + selected network.`
         );
         return;
       }
@@ -621,11 +1360,12 @@ export default function App() {
       }
 
       const memo = memos[0];
-      const lines = memo.split("\n");
-      const hashLine = lines.find((l) => l.toLowerCase().startsWith("hash:"));
-      const treasuryLine = lines.find((l) =>
-        l.toLowerCase().startsWith("treasury:")
-      );
+      const hashLine = memo
+        .split("\n")
+        .find((l: string) => l.toLowerCase().startsWith("hash:"));
+      const treasuryLine = memo
+        .split("\n")
+        .find((l: string) => l.toLowerCase().startsWith("treasury:"));
 
       const memoHash = (hashLine ?? "").replace(/^hash:\s*/i, "").trim();
       const memoTreasury = (treasuryLine ?? "")
@@ -658,728 +1398,1752 @@ export default function App() {
     }
   }
 
+  function copyPublicLink() {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "public");
+    navigator.clipboard.writeText(url.toString());
+    alert("Public view link copied ✅");
+  }
+
+  function copyShareBundle() {
+    const url = new URL(window.location.href);
+    url.searchParams.set("view", "public");
+    const publicLink = url.toString();
+
+    const proofLink = proofTxSig
+      ? explorerTxUrl(proofTxSig, settings.network)
+      : "";
+
+    const payload = [
+      "OpenTreasury (Public View)",
+      publicLink,
+      proofLink ? `Proof Tx: ${proofLink}` : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    navigator.clipboard.writeText(payload);
+    alert(
+      proofTxSig ? "Public link + proof link copied ✅" : "Public link copied ✅"
+    );
+  }
+
+  const ledgerEntries = Object.keys(meta).length;
+
+  const filteredTxs = useMemo(() => {
+    const q = globalSearch.trim().toLowerCase();
+    if (!q) return txs;
+
+    return txs.filter((t) => {
+      const m = meta[t.signature];
+      const label = (m?.label ?? "").toLowerCase();
+      const note = (m?.note ?? "").toLowerCase();
+      const proofUrl = (m?.proofUrl ?? "").toLowerCase();
+      return (
+        t.signature.toLowerCase().includes(q) ||
+        label.includes(q) ||
+        note.includes(q) ||
+        proofUrl.includes(q)
+      );
+    });
+  }, [txs, meta, globalSearch]);
+
+  const ledgerRows = useMemo(() => {
+    const q = globalSearch.trim().toLowerCase();
+    const rows = Object.entries(meta);
+    if (!q) return rows;
+
+    return rows.filter(([sig, m]) => {
+      return (
+        sig.toLowerCase().includes(q) ||
+        m.label.toLowerCase().includes(q) ||
+        (m.note ?? "").toLowerCase().includes(q) ||
+        (m.proofUrl ?? "").toLowerCase().includes(q)
+      );
+    });
+  }, [meta, globalSearch]);
+ const treasureSummary = useMemo(() => {
+  let inflow = 0;
+  let outflow = 0;
+
+  Object.values(txDeltaSol).forEach((v) => {
+    if (v > 0) inflow += v;
+    if (v < 0) outflow += v;
+  });
+
+  return {
+    inflow,
+    outflow,
+    net: inflow + outflow,
+    count: txs.length,
+  };
+ }, [txDeltaSol, txs]);  
+  const treasuryFlow = useMemo(() => {
+    const inflow: number[] = [];
+    const outflow: number[] = [];
+
+    Object.values(txDeltaSol).forEach((v) => {
+      if (v > 0) inflow.push(v);
+      if (v < 0) outflow.push(Math.abs(v));
+    });
+
+    return {
+      inflowTotal: inflow.reduce((a, b) => a + b, 0),
+      outflowTotal: outflow.reduce((a, b) => a + b, 0),
+    };
+  }, [txDeltaSol]);
+  
+  const baseBg =
+    settings.theme === "dark"
+      ? "radial-gradient(1200px 600px at 20% 0%, rgba(99,102,241,0.18), transparent 60%), radial-gradient(1000px 500px at 85% 25%, rgba(16,185,129,0.12), transparent 55%), #0b0f19"
+      : "radial-gradient(1200px 600px at 20% 0%, rgba(99,102,241,0.10), transparent 60%), radial-gradient(1000px 500px at 85% 25%, rgba(16,185,129,0.08), transparent 55%), #f7f7fb";
+
+  const cardBg =
+    settings.theme === "dark" ? "rgba(255,255,255,0.06)" : "rgba(0,0,0,0.04)";
+  const borderCol =
+    settings.theme === "dark"
+      ? "rgba(255,255,255,0.10)"
+      : "rgba(0,0,0,0.10)";
+  const textCol = settings.theme === "dark" ? "#e5e7eb" : "#0b1220";
+  const subtleCol =
+    settings.theme === "dark"
+      ? "rgba(229,231,235,0.75)"
+      : "rgba(11,18,32,0.65)";
+
+  // CSS vars so icon tiles look good in light mode too
+  const cssVars = {
+    ["--ot-border" as any]: borderCol,
+    ["--ot-btn-bg" as any]:
+      settings.theme === "dark"
+        ? "rgba(255,255,255,0.04)"
+        : "rgba(255,255,255,0.70)",
+    ["--ot-btn-active" as any]:
+      settings.theme === "dark"
+        ? "rgba(255,255,255,0.10)"
+        : "rgba(0,0,0,0.06)",
+  };
+
   return (
     <div
       style={{
-        maxWidth: 1100,
-        margin: "40px auto",
-        padding: "0 16px",
+        ...(cssVars as any),
+        minHeight: "100vh",
+        background: baseBg,
+        color: textCol,
         fontFamily: "system-ui",
       }}
     >
-      <h1 style={{ marginBottom: 4 }}>
-        OpenTreasury (MVP){isPublicView ? " — Public View" : ""}
-      </h1>
-      <p style={{ marginTop: 0, opacity: 0.8 }}>
-        Treasury transparency dashboard (devnet).{" "}
-        {isPublicView
-          ? "Read-only view for sharing."
-          : "Annotations are stored locally in your browser."}
-      </p>
-
-      {/* Top Controls */}
       <div
         style={{
-          display: "flex",
-          gap: 12,
-          flexWrap: "wrap",
-          alignItems: "end",
-          marginTop: 16,
+          maxWidth: 1220,
+          margin: "0 auto",
+          padding: "18px 16px 40px",
+          display: "grid",
+          gridTemplateColumns: isPublicView ? "1fr" : "74px 1fr",
+          gap: 14,
         }}
       >
-        <div style={{ flex: 1, minWidth: 320 }}>
-          <label
+        {!isPublicView && (
+          <div
             style={{
-              display: "block",
-              fontSize: 12,
-              opacity: 0.75,
-              marginBottom: 6,
+              position: "sticky",
+              top: 16,
+              alignSelf: "start",
+              height: "calc(100vh - 32px)",
+              borderRadius: 18,
+              border: `1px solid ${borderCol}`,
+              background: cardBg,
+              padding: 10,
+              display: "flex",
+              flexDirection: "column",
+              gap: 10,
+              backdropFilter: "blur(10px)",
             }}
           >
-            Treasury Wallet Address
-          </label>
-
-          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-            <input
-              value={treasury}
-              onChange={(e) => setTreasury(e.target.value)}
-              placeholder="Enter Solana address…"
+            <div
               style={{
-                width: "100%",
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid rgba(0,0,0,0.18)",
-                outline: "none",
-              }}
-            />
-
-            {!isPublicView && (
-              <button
-                onClick={useMyWalletAsTreasury}
-                disabled={!walletAddress}
-                title={
-                  walletAddress
-                    ? "Use your connected wallet as the treasury address"
-                    : "Connect your wallet first"
-                }
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.15)",
-                  background: walletAddress
-                    ? "rgba(0,0,0,0.06)"
-                    : "rgba(0,0,0,0.12)",
-                  fontWeight: 900,
-                  cursor: walletAddress ? "pointer" : "not-allowed",
-                  whiteSpace: "nowrap",
-                }}
-              >
-                Use My Wallet
-              </button>
-            )}
-          </div>
-        </div>
-
-        <div style={{ minWidth: 180 }}>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>Balance</div>
-          <div style={{ fontSize: 20, fontWeight: 700 }}>
-            {balanceSol === null ? "—" : `${balanceSol.toFixed(4)} SOL`}
-          </div>
-        </div>
-
-        <div style={{ minWidth: 180 }}>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>Status</div>
-          <div style={{ fontSize: 14, fontWeight: 600 }}>{status || "—"}</div>
-        </div>
-
-        <div style={{ minWidth: 180 }}>
-          <div style={{ fontSize: 12, opacity: 0.75 }}>Ledger Entries</div>
-          <div style={{ fontSize: 14, fontWeight: 700 }}>{ledgerEntries}</div>
-        </div>
-
-        {!isPublicView && (
-          <div style={{ minWidth: 320, display: "flex", gap: 10, flexWrap: "wrap" }}>
-            <button
-              onClick={copyPublicLink}
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(0,0,0,0.15)",
-                background: "#111",
-                color: "white",
+                height: 46,
+                borderRadius: 14,
+                border: `1px solid ${borderCol}`,
+                background:
+                  settings.theme === "dark"
+                    ? "rgba(255,255,255,0.08)"
+                    : "rgba(255,255,255,0.8)",
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
                 fontWeight: 900,
-                cursor: "pointer",
+                letterSpacing: 0.5,
               }}
+              title="OpenTreasury"
             >
-              Copy Public View Link
-            </button>
+              OT
+            </div>
 
-            <button
-              onClick={exportLedger}
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(0,0,0,0.15)",
-                background: "rgba(0,0,0,0.06)",
-                fontWeight: 900,
-                cursor: "pointer",
-              }}
+            <ToolIconButton
+              label="Dashboard"
+              active={view === "dashboard"}
+              onClick={() => setView("dashboard")}
             >
-              Download OTMS JSON
-            </button>
+              <Icons.Dashboard size={24} />
+            </ToolIconButton>
 
-            <label
-              style={{
-                flex: 1,
-                padding: "10px 12px",
-                borderRadius: 12,
-                border: "1px solid rgba(0,0,0,0.15)",
-                background: "rgba(0,0,0,0.06)",
-                fontWeight: 900,
-                cursor: "pointer",
-                textAlign: "center",
-              }}
+            <ToolIconButton
+              label="Treasury Ledger"
+              active={view === "ledger"}
+              onClick={() => setView("ledger")}
             >
-              Import JSON
-              <input
-                type="file"
-                accept="application/json"
-                style={{ display: "none" }}
-                onChange={(e) => {
-                  const file = e.target.files?.[0];
-                  if (file) importLedgerFile(file);
-                  e.currentTarget.value = "";
-                }}
-              />
-            </label>
+              <Icons.Ledger />
+            </ToolIconButton>
+
+            <ToolIconButton
+              label="Protocol Proof"
+              active={view === "proof"}
+              onClick={() => setView("proof")}
+            >
+              <Icons.Proof />
+            </ToolIconButton>
+
+            <ToolIconButton
+              label="Verify Proof"
+              active={view === "verify"}
+              onClick={() => setView("verify")}
+            >
+              <Icons.Verify />
+            </ToolIconButton>
+
+            <div style={{ flex: 1 }} />
+
+            <ToolIconButton
+              label="Settings"
+              active={view === "settings"}
+              onClick={() => setView("settings")}
+            >
+              <Icons.Settings />
+            </ToolIconButton>
           </div>
         )}
-      </div>
 
-      {/* Protocol Proof */}
-      {!isPublicView && (
-        <div
-          style={{
-            marginTop: 14,
-            border: "1px solid rgba(0,0,0,0.12)",
-            borderRadius: 12,
-            padding: 12,
-            background: "rgba(0,0,0,0.02)",
-          }}
-        >
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 900 }}>Protocol Proof</div>
-              <div style={{ fontSize: 12, opacity: 0.75 }}>
-                OTMS JSON → SHA-256 hash → anchor hash on-chain (Memo).
-              </div>
-            </div>
-
-            <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-              <button
-                onClick={connectWallet}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: "1px solid rgba(0,0,0,0.15)",
-                  background: "#111",
-                  color: "white",
-                  fontWeight: 900,
-                  cursor: "pointer",
-                }}
-              >
-                {walletAddress
-                  ? `Wallet: ${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}`
-                  : "Connect Wallet"}
-              </button>
-
-              <button
-                onClick={generateProof}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: "1px solid rgba(0,0,0,0.15)",
-                  background: "rgba(0,0,0,0.06)",
-                  fontWeight: 900,
-                  cursor: "pointer",
-                }}
-              >
-                Generate Proof Hash
-              </button>
-
-              <button
-                onClick={anchorProofOnChain}
-                style={{
-                  padding: "10px 12px",
-                  borderRadius: 12,
-                  border: "1px solid rgba(0,0,0,0.15)",
-                  background: proofHash ? "#111" : "rgba(0,0,0,0.12)",
-                  color: proofHash ? "white" : "rgba(0,0,0,0.45)",
-                  fontWeight: 900,
-                  cursor: proofHash ? "pointer" : "not-allowed",
-                }}
-                disabled={!proofHash}
-              >
-                Anchor On-Chain (Devnet)
-              </button>
-            </div>
-          </div>
-
-          <div style={{ marginTop: 10, fontSize: 13 }}>
-            <div style={{ opacity: 0.75 }}>Current Proof Hash</div>
-            <div style={{ fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace", wordBreak: "break-all" }}>
-              {proofHash || "—"}
-            </div>
-
-            {proofTxSig && (
-              <div style={{ marginTop: 6 }}>
-                Anchored Tx:{" "}
-                <a
-                  href={`https://explorer.solana.com/tx/${proofTxSig}?cluster=devnet`}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{ fontWeight: 900, textDecoration: "none" }}
-                >
-                  {shortSig(proofTxSig)}
-                </a>
-              </div>
-            )}
-
-            {proofMsg && <div style={{ marginTop: 6 }}>{proofMsg}</div>}
-
-            {proofJson && (
-              <details style={{ marginTop: 10 }}>
-                <summary style={{ cursor: "pointer", fontWeight: 900 }}>
-                  View OTMS JSON (Proof Payload)
-                </summary>
-                <pre
+        <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+          {/* Header */}
+          <div
+            style={{
+              borderRadius: 18,
+              border: `1px solid ${borderCol}`,
+              background: cardBg,
+              padding: "14px 14px",
+              backdropFilter: "blur(10px)",
+            }}
+          >
+            <div
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                gap: 12,
+                flexWrap: "wrap",
+                alignItems: "center",
+              }}
+            >
+              <div>
+                <div
                   style={{
-                    marginTop: 10,
-                    padding: 12,
-                    borderRadius: 12,
-                    border: "1px solid rgba(0,0,0,0.12)",
-                    background: "rgba(0,0,0,0.03)",
-                    overflowX: "auto",
-                    fontSize: 12,
+                    fontWeight: 950,
+                    fontSize: 18,
+                    letterSpacing: 0.2,
                   }}
                 >
-                  {proofJson}
-                </pre>
-              </details>
-            )}
-          </div>
+                  OpenTreasury (MVP){isPublicView ? " — Public View" : ""}
+                </div>
+                <div style={{ fontSize: 12, color: subtleCol, marginTop: 2 }}>
+                  Treasury transparency dashboard ({settings.network}).{" "}
+                  {isPublicView
+                    ? "Read-only view for sharing."
+                    : "Annotations are stored locally in your browser."}
+                </div>
+              </div>
 
-          {/* Proof Verification */}
-          <div style={{ marginTop: 14, borderTop: "1px solid rgba(0,0,0,0.08)", paddingTop: 12 }}>
-            <div style={{ fontSize: 14, fontWeight: 900 }}>Proof Verification</div>
-            <div style={{ fontSize: 12, opacity: 0.75, marginBottom: 10 }}>
-              Paste the on-chain tx signature + the OTMS JSON, then verify the hash matches the Memo.
+              <div
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                {/* Search */}
+                <div
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    padding: "10px 12px",
+                    borderRadius: 14,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.25)"
+                        : "rgba(255,255,255,0.7)",
+                    minWidth: 280,
+                  }}
+                  title="Search by signature, category, description, link"
+                >
+                  <span style={{ opacity: 0.8 }}>
+                    <Icons.Search />
+                  </span>
+                  <input
+                    value={globalSearch}
+                    onChange={(e) => setGlobalSearch(e.target.value)}
+                    placeholder="Search transactions…"
+                    style={{
+                      width: "100%",
+                      border: "none",
+                      outline: "none",
+                      background: "transparent",
+                      color: textCol,
+                      fontSize: 13,
+                    }}
+                  />
+                </div>
+
+                {!isPublicView && (
+                  <ToolIconButton
+                    label={
+                      settings.theme === "dark"
+                        ? "Switch to Light mode"
+                        : "Switch to Dark mode"
+                    }
+                    onClick={() =>
+                      setSettings((s) => ({
+                        ...s,
+                        theme: s.theme === "dark" ? "light" : "dark",
+                      }))
+                    }
+                  >
+                    {settings.theme === "dark" ? <Icons.Moon /> : <Icons.Sun />}
+                  </ToolIconButton>
+                )}
+
+                {!isPublicView && (
+                  <ToolIconButton
+                    label="Share (copy public link + proof link)"
+                    onClick={copyShareBundle}
+                  >
+                    <Icons.Share />
+                  </ToolIconButton>
+                )}
+
+                {isPublicView && (
+                  <button
+                    onClick={() => {
+                      const url = new URL(window.location.href);
+                      url.searchParams.delete("view");
+                      navigator.clipboard.writeText(url.toString());
+                      alert("Private link (no ?view=public) copied ✅");
+                    }}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 14,
+                      border: `1px solid ${borderCol}`,
+                      background:
+                        settings.theme === "dark"
+                          ? "rgba(255,255,255,0.08)"
+                          : "rgba(255,255,255,0.8)",
+                      color: textCol,
+                      fontWeight: 900,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Copy Private Link
+                  </button>
+                )}
+              </div>
             </div>
 
-            <div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 10 }}>
-              <input
-                value={verifyTx}
-                onChange={(e) => setVerifyTx(e.target.value)}
-                placeholder="Paste devnet tx signature here…"
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.18)",
-                  outline: "none",
-                }}
-              />
-
-              <textarea
-                value={verifyJson}
-                onChange={(e) => setVerifyJson(e.target.value)}
-                placeholder="Paste OTMS JSON here…"
-                rows={8}
-                style={{
-                  width: "100%",
-                  padding: "10px 12px",
-                  borderRadius: 10,
-                  border: "1px solid rgba(0,0,0,0.18)",
-                  outline: "none",
-                  fontFamily: "ui-monospace, SFMono-Regular, Menlo, monospace",
-                  fontSize: 12,
-                }}
-              />
-
-              <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
-                <button
-                  onClick={verifyProof}
+            {/* Treasury row */}
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: isPublicView
+                  ? "1fr"
+                  : "1.4fr 0.6fr 0.6fr 0.6fr",
+                gap: 12,
+                marginTop: 14,
+                alignItems: "end",
+              }}
+            >
+              <div style={{ minWidth: 0 }}>
+                <label
                   style={{
-                    padding: "10px 12px",
-                    borderRadius: 12,
-                    border: "1px solid rgba(0,0,0,0.15)",
-                    background: "#111",
-                    color: "white",
-                    fontWeight: 900,
+                    display: "block",
+                    fontSize: 12,
+                    color: subtleCol,
+                    marginBottom: 6,
+                  }}
+                >
+                  Treasury Wallet Address
+                </label>
+                <input
+                  value={treasury}
+                  onChange={(e) => setTreasury(e.target.value)}
+                  placeholder="Enter Solana address…"
+                  style={{
+                    boxSizing: "border-box",
+                    width: "100%",
+                    padding: "12px 12px",
+                    borderRadius: 14,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.25)"
+                        : "rgba(255,255,255,0.7)",
+                    outline: "none",
+                    color: textCol,
+                    fontSize: 13,
+                  }}
+                />
+                <div style={{ marginTop: 6, fontSize: 12, color: subtleCol }}>
+                  Explorer:{" "}
+                  <a
+                    href={explorerAddrUrl(treasury.trim(), settings.network)}
+                    target="_blank"
+                    rel="noreferrer"
+                    style={{
+                      color: textCol,
+                      fontWeight: 900,
+                      textDecoration: "none",
+                    }}
+                  >
+                    view →
+                  </a>
+                </div>
+              </div>
+
+              <div
+               style={{
+                 borderRadius: 18,
+                 border: `1px solid ${borderCol}`,
+                 background: cardBg,
+                 padding: "12px 12px",
+               }}
+             >
+               <div style={{ fontSize: 12, color: subtleCol }}>Balance</div>
+
+               <div style={{ fontSize: 18, fontWeight: 900 }}>
+                 {balanceSol === null
+                   ? "—"
+                   : settings.hideBalance
+                   ? "••••"
+                   : `${balanceSol.toFixed(4)} SOL`}
+               </div>
+
+               {!isPublicView && (
+                 <button
+                   type="button"
+                   onClick={() =>
+                     setSettings((s) => ({ ...s, hideBalance: !s.hideBalance }))
+                   }
+                   title={settings.hideBalance ? "Show balance" : "Hide balance"}
+                   style={{
+                     marginTop: 8,
+                     padding: 0,
+                     border: "none",
+                     background: "transparent",
+                     color: subtleCol,
+                     cursor: "pointer",
+                     display: "inline-flex",
+                     alignItems: "center",
+                     justifyContent: "center",
+                   }}
+                 >
+                   {settings.hideBalance ? <Icons.EyeOff size={18} /> : <Icons.Eye size={18} />}
+                 </button>
+               )}
+             </div>
+             
+              <div
+                style={{
+                  borderRadius: 18,
+                  border: `1px solid ${borderCol}`,
+                  background: cardBg,
+                  padding: "12px 12px",
+                }}
+              >
+                <div style={{ fontSize: 12, color: subtleCol }}>Status</div>
+                <div style={{ fontSize: 13, fontWeight: 900 }}>
+                  {status || "—"}
+                </div>
+              </div>
+
+              <div
+                style={{
+                  borderRadius: 18,
+                  border: `1px solid ${borderCol}`,
+                  background: cardBg,
+                  padding: "12px 12px",
+                }}
+              >
+                <div style={{ fontSize: 12, color: subtleCol }}>
+                  Ledger Entries
+                </div>
+                <div style={{ fontSize: 13, fontWeight: 900 }}>
+                  {ledgerEntries}
+                </div>
+              </div>
+            </div>
+            <div
+            style={{
+               display: "grid",
+               gridTemplateColumns: "repeat(4, 1fr)",
+               gap: 12,
+               marginTop: 12,
+              }}
+            >
+             <div
+               style={{
+                 display: "grid",
+                 gridTemplateColumns: "repeat(4, 1fr)",
+                 gap: 12,
+                 marginTop: 12,
+               }}
+            >
+             <div style={{ fontSize: 12, color: subtleCol }}>Total Inflow</div>
+             <div style={{ fontSize: 18, fontWeight: 900, color: "#34d399" }}>
+             +{treasureSummary.inflow.toFixed(3)} SOL
+             </div>
+            </div>
+            <div
+              style={{
+               borderRadius: 18,
+               border: `1px solid ${borderCol}`,
+               background: cardBg,
+               padding: "12px",
+              }}
+            >
+              <div style={{ fontSize: 12, color: subtleCol }}>Net Flow</div>
+              <div
+                style={{
+                 fontSize: 18,
+                 fontWeight: 900,
+                 color:
+                 treasureSummary.net >= 0
+                   ? "#34d399"
+                   : "#fb7185",
+              }}
+             >
+               {treasureSummary.net >= 0 ? "+" : ""}
+               {treasureSummary.net.toFixed(3)} SOL
+             </div>
+           </div>
+
+           <div
+               style={{
+                 borderRadius: 18,
+                 border: `1px solid ${borderCol}`,
+                 background: cardBg,
+                 padding: "12px",
+               }}
+           >
+             <div style={{ fontSize: 12, color: subtleCol }}>
+               Transactions Indexed
+             </div>
+             <div style={{ fontSize: 18, fontWeight: 900 }}>
+                {treasureSummary.count}
+              </div>
+            </div>
+          </div>
+
+
+            {/* Header actions (icons) */}
+            {!isPublicView && (
+              <div
+                style={{
+                  display: "flex",
+                  gap: 10,
+                  flexWrap: "wrap",
+                  marginTop: 12,
+                }}
+              >
+                <ToolIconButton
+                  label="Copy Public View Link"
+                  onClick={copyPublicLink}
+                >
+                  <Icons.Link />
+                </ToolIconButton>
+
+                <ToolIconButton
+                  label="Download OTMS JSON"
+                  onClick={exportLedger}
+                >
+                  <Icons.Download />
+                </ToolIconButton>
+
+                <label
+                  title="Import JSON"
+                  style={{
+                    width: 44,
+                    height: 44,
+                    borderRadius: 14,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(255,255,255,0.04)"
+                        : "rgba(255,255,255,0.70)",
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
                     cursor: "pointer",
                   }}
                 >
-                  Verify Proof
-                </button>
-
-                {verifyTx.trim() && (
-                  <a
-                    href={`https://explorer.solana.com/tx/${verifyTx.trim()}?cluster=devnet`}
-                    target="_blank"
-                    rel="noreferrer"
-                    style={{ alignSelf: "center", fontWeight: 900, textDecoration: "none" }}
-                  >
-                    Open Tx in Explorer →
-                  </a>
-                )}
+                  <Icons.Upload />
+                  <input
+                    type="file"
+                    accept="application/json"
+                    style={{ display: "none" }}
+                    onChange={(e) => {
+                      const file = e.target.files?.[0];
+                      if (file) importLedgerFile(file);
+                      e.currentTarget.value = "";
+                    }}
+                  />
+                </label>
               </div>
-
-              {verifyMsg && (
-                <pre
-                  style={{
-                    marginTop: 6,
-                    padding: 12,
-                    borderRadius: 12,
-                    border: "1px solid rgba(0,0,0,0.12)",
-                    background: "rgba(0,0,0,0.03)",
-                    whiteSpace: "pre-wrap",
-                  }}
-                >
-                  {verifyMsg}
-                </pre>
-              )}
-            </div>
+            )}
           </div>
-        </div>
-      )}
 
-      {/* Tabs */}
-      <div style={{ display: "flex", gap: 10, marginTop: 14 }}>
-        <button
-          onClick={() => setTab("Dashboard")}
-          style={{
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(0,0,0,0.15)",
-            background: tab === "Dashboard" ? "#111" : "rgba(0,0,0,0.06)",
-            color: tab === "Dashboard" ? "white" : "black",
-            fontWeight: 900,
-            cursor: "pointer",
-          }}
-        >
-          Dashboard
-        </button>
-        <button
-          onClick={() => setTab("Treasury Ledger")}
-          style={{
-            padding: "10px 12px",
-            borderRadius: 12,
-            border: "1px solid rgba(0,0,0,0.15)",
-            background: tab === "Treasury Ledger" ? "#111" : "rgba(0,0,0,0.06)",
-            color: tab === "Treasury Ledger" ? "white" : "black",
-            fontWeight: 900,
-            cursor: "pointer",
-          }}
-        >
-          Treasury Ledger ({ledgerEntries})
-        </button>
-      </div>
-
-      {error && (
-        <div
-          style={{
-            marginTop: 16,
-            padding: 12,
-            borderRadius: 10,
-            background: "rgba(255,0,0,0.08)",
-            border: "1px solid rgba(255,0,0,0.2)",
-          }}
-        >
-          <b>Error:</b> {error}
-          <div style={{ marginTop: 6, fontSize: 12, opacity: 0.8 }}>
-            Tip: We’re on <b>devnet</b> right now.
-          </div>
-        </div>
-      )}
-
-      {/* Dashboard */}
-      {tab === "Dashboard" && (
-        <div
-          style={{
-            display: "grid",
-            gridTemplateColumns: "1.5fr 1fr",
-            gap: 14,
-            marginTop: 20,
-          }}
-        >
-          <div>
-            <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
-              Recent Transactions {isPublicView ? "" : "(select to annotate)"}
-            </h2>
-
+          {/* Error */}
+          {error && (
             <div
               style={{
-                overflowX: "auto",
-                border: "1px solid rgba(0,0,0,0.12)",
-                borderRadius: 12,
+                borderRadius: 18,
+                border: "1px solid rgba(255,0,0,0.25)",
+                background:
+                  settings.theme === "dark"
+                    ? "rgba(255,0,0,0.08)"
+                    : "rgba(255,0,0,0.06)",
+                padding: 14,
               }}
             >
-              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
-                <thead style={{ background: "rgba(0,0,0,0.03)" }}>
-                  <tr>
-                    <th style={{ textAlign: "left", padding: 10 }}>Signature</th>
-                    <th style={{ textAlign: "left", padding: 10 }}>Time</th>
-                    <th style={{ textAlign: "left", padding: 10 }}>Category</th>
-                    <th style={{ textAlign: "left", padding: 10 }}>Status</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {txs.length === 0 ? (
-                    <tr>
-                      <td colSpan={4} style={{ padding: 12, opacity: 0.7 }}>
-                        No transactions found (or still loading).
-                      </td>
-                    </tr>
-                  ) : (
-                    txs.map((t) => {
-                      const isSelected = selectedSig === t.signature;
-                      const label = meta[t.signature]?.label ?? "—";
-
-                      return (
-                        <tr
-                          key={t.signature}
-                          onClick={() => {
-                            if (isPublicView) return;
-                            setSelectedSig(t.signature);
-                            setTimeout(scrollToEditor, 50);
-                          }}
-                          style={{
-                            cursor: isPublicView ? "default" : "pointer",
-                            borderTop: "1px solid rgba(0,0,0,0.08)",
-                            background: isSelected ? "rgba(0,0,0,0.04)" : "transparent",
-                          }}
-                        >
-                          <td style={{ padding: 10 }}>
-                            <a
-                              href={`https://explorer.solana.com/tx/${t.signature}?cluster=devnet`}
-                              target="_blank"
-                              rel="noreferrer"
-                              style={{ textDecoration: "none" }}
-                              title={t.signature}
-                              onClick={(e) => e.stopPropagation()}
-                            >
-                              {shortSig(t.signature)}
-                            </a>
-                          </td>
-                          <td style={{ padding: 10 }}>{formatTime(t.blockTime)}</td>
-                          <td style={{ padding: 10, fontWeight: 900, color: labelColor(label) }}>
-                            {label}
-                          </td>
-                          <td style={{ padding: 10 }}>
-                            {t.err ? (
-                              <span style={{ color: "#dc2626", fontWeight: 800 }}>Failed</span>
-                            ) : (
-                              <span style={{ color: "#16a34a", fontWeight: 800 }}>Confirmed</span>
-                            )}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
+              <b>Error:</b> {error}
+              <div style={{ marginTop: 6, fontSize: 12, color: subtleCol }}>
+                Tip: Network is <b>{settings.network}</b>.
+              </div>
             </div>
+          )}
 
-            <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-              Tip: The ledger tab is your searchable index of annotated transactions.
-            </div>
-          </div>
-
-          {/* Editor */}
-          {!isPublicView && (
-            <div ref={editorRef}>
-              <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 16 }}>
-                Transaction Annotation
-              </h2>
-
-              <div style={{ border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
-                {!selectedSig ? (
-                  <div style={{ opacity: 0.75, fontSize: 13 }}>
-                    Select a transaction to add context and supporting evidence.
+          {/* MAIN VIEWS */}
+          {view === "dashboard" && (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: isPublicView ? "1fr" : "1.6fr 1fr",
+                gap: 14,
+              }}
+            >
+              {/* Recent transactions */}
+              <div
+                style={{
+                  borderRadius: 18,
+                  border: `1px solid ${borderCol}`,
+                  background: cardBg,
+                  padding: 14,
+                  backdropFilter: "blur(10px)",
+                }}
+              >
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    gap: 10,
+                    alignItems: "center",
+                  }}
+                >
+                  <div style={{ fontWeight: 950, fontSize: 14 }}>
+                    Recent Transactions {isPublicView ? "" : "(click to annotate)"}
                   </div>
-                ) : (
-                  <>
-                    <div style={{ fontSize: 12, opacity: 0.75 }}>Selected Transaction</div>
-                    <div style={{ fontWeight: 900, marginBottom: 14 }}>
-                      {shortSig(selectedSig)}
+                  {!isPublicView && (
+                    <div style={{ fontSize: 12, color: subtleCol }}>
+                      Tip: use search to filter by category (Donation/Grant/etc).
                     </div>
-
-                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                      Category
-                    </label>
-                    <select
-                      value={editLabel}
-                      onChange={(e) => setEditLabel(e.target.value as LabelType)}
+                  )}
+                  {!isPublicView && (
+                    <div
                       style={{
-                        width: "100%",
-                        padding: "10px 12px",
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.25)",
-                        outline: "none",
-                        background: "rgba(0,0,0,0.04)",
-                        marginBottom: 12,
-                        fontWeight: 800,
+                        marginTop: 14,
+                        borderRadius: 18,
+                        border: `1px solid ${borderCol}`,
+                        background: cardBg,
+                        padding: 14,
                       }}
                     >
-                      {["Donation", "Grant", "Ops", "Milestone", "Other"].map((x) => (
-                        <option key={x} value={x}>
-                          {x}
-                        </option>
-                      ))}
-                    </select>
+                      <div style={{ fontWeight: 900, marginBottom: 8 }}>
+                        Treasury Flow
+                      </div>
 
-                    {editLabel === "Other" && (
+                      <div
+                        style={{
+                          display: "flex",
+                          height: 12,
+                          borderRadius: 8,
+                          overflow: "hidden",
+                          background:
+                            settings.theme === "dark"
+                              ? "rgba(255,255,255,0.08)"
+                              : "rgba(0,0,0,0.08)",
+                        }}
+                      >
+                       <div
+                         style={{
+                           width: `${
+                             (treasuryFlow.inflowTotal /
+                               ((treasuryFlow.inflowTotal + treasuryFlow.outflowTotal) || 1)) *
+                             100
+                           }%`,
+                           background: "#34d399",
+                         }}
+                       />
+
+                       <div
+                         style={{
+                           width: `${
+                             (treasuryFlow.outflowTotal /
+                               ((treasuryFlow.inflowTotal + treasuryFlow.outflowTotal) || 1)) *
+                             100
+                           }%`,
+                           background: "#fb7185",
+                         }}
+                       />
+                     </div>
+
+                     <div
+                       style={{
+                         display: "flex",
+                         justifyContent: "space-between",
+                         marginTop: 6,
+                         fontSize: 12,
+                         color: subtleCol,
+                       }}
+                    >
+                      <span>Inflow: +{treasuryFlow.inflowTotal.toFixed(3)} SOL</span>
+                      <span>Outflow: {treasuryFlow.outflowTotal.toFixed(3)} SOL</span>
+                    </div>
+                  </div>
+                )}
+                </div>
+
+                <div
+                  style={{
+                    marginTop: 10,
+                    overflowX: "auto",
+                    borderRadius: 16,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.18)"
+                        : "rgba(255,255,255,0.6)",
+                  }}
+                >
+                  <table
+                    style={{
+                      width: "100%",
+                      borderCollapse: "collapse",
+                      fontSize: 13,
+                    }}
+                  >
+                    <thead>
+                      <tr style={{ borderBottom: `1px solid ${borderCol}` }}>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            color: subtleCol,
+                          }}
+                        >
+                          Signature
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            color: subtleCol,
+                          }}
+                        >
+                          Time
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            color: subtleCol,
+                          }}
+                        >
+                          Category
+                        </th>
+                        <th 
+                         style={{ 
+                           textAlign: "left",
+                           padding: 12,
+                           color: subtleCol,
+                         }}
+                        >
+                          Amount
+                        </th>
+                        <th
+                          style={{
+                            textAlign: "left",
+                            padding: 12,
+                            color: subtleCol,
+                          }}
+                        >
+                          Status
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {filteredTxs.length === 0 ? (
+                        <tr>
+                          <td colSpan={5} style={{ padding: 12, color: subtleCol }}>
+                            No transactions found (or still loading).
+                          </td>
+                        </tr>
+                      ) : (
+                        filteredTxs.map((t) => {
+                          const isSelected = selectedSig === t.signature;
+                          const label = meta[t.signature]?.label ?? "—";
+
+                          return (
+                            <tr
+                              key={t.signature}
+                              onClick={() => {
+                                if (isPublicView) return;
+                                setSelectedSig(t.signature);
+                                setTimeout(scrollToEditor, 50);
+                              }}
+                              style={{
+                                cursor: isPublicView ? "default" : "pointer",
+                                borderTop: `1px solid ${borderCol}`,
+                                background: isSelected
+                                  ? "rgba(255,255,255,0.06)"
+                                  : "transparent",
+                              }}
+                            >
+                              <td style={{ padding: 12 }}>
+                                <a
+                                  href={explorerTxUrl(t.signature, settings.network)}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  style={{
+                                    textDecoration: "none",
+                                    color: textCol,
+                                    fontWeight: 900,
+                                  }}
+                                  title={t.signature}
+                                  onClick={(e) => e.stopPropagation()}
+                                >
+                                  {shortSig(t.signature)}
+                                </a>
+                              </td>
+                              <td style={{ padding: 12, color: subtleCol }}>
+                                {formatTime(t.blockTime)}
+                              </td>
+                              <td
+                                style={{
+                                  padding: 12,
+                                  fontWeight: 900,
+                                  color: labelColor(label),
+                                }}
+                              >
+                                {label}
+                              </td>
+                              <td style={{ padding: 12, fontWeight: 900 }}>
+                                {txDeltaLoading[t.signature] ? (
+                                  <span style={{ color: subtleCol }}>…</span>
+                                ) : txDeltaSol[t.signature] === undefined ? (
+                                  <span style={{ color: subtleCol }}>—</span>
+                                ) : (
+                                  <span
+                                    style={{
+                                      display: "flex",
+                                      alignItems: "center",
+                                      gap: 8,
+                                    }}
+                                  >
+                                   <span
+                                     style={{
+                                       color: txDeltaSol[t.signature] >= 0 ? "#34d399" : "#fb7185",
+                                     }}
+                                   >
+                                     {formatSolDelta(txDeltaSol[t.signature])}
+                                   </span>
+
+                                   <span
+                                     style={{
+                                       fontSize: 11,
+                                       fontWeight: 900,
+                                       padding: "3px 6px",
+                                       borderRadius: 6,
+                                       background:
+                                         txDeltaSol[t.signature] >= 0
+                                           ? "rgba(52,211,153,0.15)"
+                                           : "rgba(251,113,133,0.15)",
+                                       color:
+                                         txDeltaSol[t.signature] >= 0
+                                           ? "#34d399"
+                                           : "#fb7185",
+                                     }}
+                                   >
+                                     {txDeltaSol[t.signature] >= 0 ? "IN" : "OUT"}
+                                   </span>
+                                 </span>
+                               )}
+                             </td>
+                            </tr>
+                          );
+                        })
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+
+              {/* Annotation editor */}
+              {!isPublicView && (
+                <div
+                  ref={editorRef}
+                  style={{
+                    borderRadius: 18,
+                    border: `1px solid ${borderCol}`,
+                    background: cardBg,
+                    padding: 14,
+                    backdropFilter: "blur(10px)",
+                  }}
+                >
+                  <div style={{ fontWeight: 950, fontSize: 14 }}>
+                    Transaction Annotation
+                  </div>
+                  <div style={{ marginTop: 10 }}>
+                    {!selectedSig ? (
+                      <div style={{ color: subtleCol, fontSize: 13 }}>
+                        Select a transaction to add context and evidence.
+                      </div>
+                    ) : (
                       <>
-                        <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                          Custom Category Name
+                        <div style={{ fontSize: 12, color: subtleCol }}>
+                          Selected Transaction
+                        </div>
+                        <div
+                          style={{
+                            fontWeight: 950,
+                            marginTop: 4,
+                            marginBottom: 12,
+                          }}
+                        >
+                          {shortSig(selectedSig)}
+                        </div>
+
+                        <label
+                          style={{
+                            display: "block",
+                            fontSize: 12,
+                            color: subtleCol,
+                            marginBottom: 6,
+                          }}
+                        >
+                          Category
                         </label>
-                        <input
-                          value={editOtherDetail}
-                          onChange={(e) => setEditOtherDetail(e.target.value)}
-                          placeholder="e.g., Sponsorship, Refund, Equipment"
+                        <select
+                          value={editLabel}
+                          onChange={(e) => setEditLabel(e.target.value as LabelType)}
                           style={{
                             width: "100%",
-                            padding: "10px 12px",
-                            borderRadius: 10,
-                            border: "1px solid rgba(0,0,0,0.18)",
+                            padding: "12px 12px",
+                            borderRadius: 14,
+                            border: `1px solid ${borderCol}`,
                             outline: "none",
+                            background:
+                              settings.theme === "dark"
+                                ? "rgba(0,0,0,0.25)"
+                                : "rgba(255,255,255,0.7)",
+                            color: textCol,
+                            marginBottom: 12,
+                            fontWeight: 900,
+                          }}
+                        >
+                          {["Donation", "Grant", "Ops", "Milestone", "Other"].map((x) => (
+                            <option key={x} value={x}>
+                              {x}
+                            </option>
+                          ))}
+                        </select>
+
+                        {editLabel === "Other" && (
+                          <>
+                            <label
+                              style={{
+                                display: "block",
+                                fontSize: 12,
+                                color: subtleCol,
+                                marginBottom: 6,
+                              }}
+                            >
+                              Custom Category Name
+                            </label>
+                            <input
+                              value={editOtherDetail}
+                              onChange={(e) => setEditOtherDetail(e.target.value)}
+                              placeholder="e.g., Sponsorship, Refund, Equipment"
+                              style={{
+                                width: "100%",
+                                padding: "12px 12px",
+                                borderRadius: 14,
+                                border: `1px solid ${borderCol}`,
+                                outline: "none",
+                                background:
+                                  settings.theme === "dark"
+                                    ? "rgba(0,0,0,0.25)"
+                                    : "rgba(255,255,255,0.7)",
+                                color: textCol,
+                                marginBottom: 12,
+                              }}
+                            />
+                          </>
+                        )}
+
+                        <label
+                          style={{
+                            display: "block",
+                            fontSize: 12,
+                            color: subtleCol,
+                            marginBottom: 6,
+                          }}
+                        >
+                          Description
+                        </label>
+                        <input
+                          value={editNote}
+                          onChange={(e) => setEditNote(e.target.value)}
+                          placeholder="Brief explanation of transaction purpose"
+                          style={{
+                            width: "100%",
+                            boxSizing: "border-box",
+                            padding: "12px 12px",
+                            borderRadius: 14,
+                            border: `1px solid ${borderCol}`,
+                            outline: "none",
+                            background:
+                              settings.theme === "dark"
+                                ? "rgba(0,0,0,0.25)"
+                                : "rgba(255,255,255,0.7)",
+                            color: textCol,
                             marginBottom: 12,
                           }}
                         />
+
+                        <label
+                          style={{
+                            display: "block",
+                            fontSize: 12,
+                            color: subtleCol,
+                            marginBottom: 6,
+                          }}
+                        >
+                          Supporting Link
+                        </label>
+                        <input
+                          value={editProof}
+                          onChange={(e) => setEditProof(e.target.value)}
+                          placeholder="https://documentation-or-proof-link"
+                          style={{
+                            width: "100%",
+                            boxSizing: "border-box",
+                            padding: "12px 12px",
+                            borderRadius: 14,
+                            border: `1px solid ${borderCol}`,
+                            outline: "none",
+                            background:
+                              settings.theme === "dark"
+                                ? "rgba(0,0,0,0.25)"
+                                : "rgba(255,255,255,0.7)",
+                            color: textCol,
+                            marginBottom: 12,
+                          }}
+                        />
+
+                        <div style={{ display: "flex", gap: 10 }}>
+                          <button
+                            onClick={saveMeta}
+                            style={{
+                              flex: 1,
+                              padding: "12px 12px",
+                              borderRadius: 14,
+                              border: `1px solid ${borderCol}`,
+                              background:
+                                settings.theme === "dark"
+                                  ? "rgba(255,255,255,0.10)"
+                                  : "rgba(255,255,255,0.85)",
+                              color: textCol,
+                              fontWeight: 950,
+                              cursor: "pointer",
+                            }}
+                          >
+                            Save
+                          </button>
+                          <button
+                            onClick={clearMeta}
+                            style={{
+                              padding: "12px 12px",
+                              borderRadius: 14,
+                              border: `1px solid ${borderCol}`,
+                              background: "transparent",
+                              color: textCol,
+                              fontWeight: 950,
+                              cursor: "pointer",
+                            }}
+                          >
+                            Remove
+                          </button>
+                        </div>
+
+                        {saveMsg && (
+                          <div style={{ marginTop: 10, fontSize: 13, color: subtleCol }}>
+                            {saveMsg}
+                          </div>
+                        )}
                       </>
                     )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
 
-                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                      Description
-                    </label>
-                    <input
-                      value={editNote}
-                      onChange={(e) => setEditNote(e.target.value)}
-                      placeholder="Brief explanation of transaction purpose"
-                      style={{
-                        width: "100%",
-                        padding: "10px 12px",
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.18)",
-                        outline: "none",
-                        marginBottom: 12,
-                      }}
-                    />
+          {view === "ledger" && (
+            <div
+              style={{
+                borderRadius: 18,
+                border: `1px solid ${borderCol}`,
+                background: cardBg,
+                padding: 14,
+                backdropFilter: "blur(10px)",
+              }}
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  flexWrap: "wrap",
+                }}
+              >
+                <div style={{ fontWeight: 950, fontSize: 14 }}>
+                  Treasury Ledger ({ledgerEntries})
+                </div>
+                <div style={{ fontSize: 12, color: subtleCol }}>
+                  Search filters this ledger too.
+                </div>
+              </div>
 
-                    <label style={{ display: "block", fontSize: 12, opacity: 0.75, marginBottom: 6 }}>
-                      Supporting Link
-                    </label>
-                    <input
-                      value={editProof}
-                      onChange={(e) => setEditProof(e.target.value)}
-                      placeholder="https://documentation-or-proof-link"
-                      style={{
-                        width: "100%",
-                        padding: "10px 12px",
-                        borderRadius: 10,
-                        border: "1px solid rgba(0,0,0,0.18)",
-                        outline: "none",
-                        marginBottom: 14,
-                      }}
-                    />
-
-                    <div style={{ display: "flex", gap: 10 }}>
-                      <button
-                        onClick={saveMeta}
+              <div style={{ marginTop: 12 }}>
+                {ledgerRows.length === 0 ? (
+                  <div style={{ color: subtleCol }}>No ledger entries found.</div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    {ledgerRows.slice(0, 250).map(([sig, m]) => (
+                      <div
+                        key={sig}
                         style={{
-                          padding: "10px 12px",
-                          borderRadius: 10,
-                          border: "1px solid rgba(0,0,0,0.15)",
-                          background: "#111",
-                          color: "white",
-                          fontWeight: 900,
-                          cursor: "pointer",
-                          flex: 1,
+                          display: "grid",
+                          gridTemplateColumns: "180px 120px 1fr 120px",
+                          gap: 12,
+                          alignItems: "center",
+                          padding: "12px 12px",
+                          borderRadius: 16,
+                          border: `1px solid ${borderCol}`,
+                          background:
+                            settings.theme === "dark"
+                              ? "rgba(0,0,0,0.20)"
+                              : "rgba(255,255,255,0.6)",
                         }}
                       >
-                        Save Annotation
-                      </button>
-                      <button
-                        onClick={clearMeta}
-                        style={{
-                          padding: "10px 12px",
-                          borderRadius: 10,
-                          border: "1px solid rgba(0,0,0,0.15)",
-                          background: "rgba(0,0,0,0.04)",
-                          fontWeight: 900,
-                          cursor: "pointer",
-                        }}
-                      >
-                        Remove Annotation
-                      </button>
-                    </div>
+                        <a
+                          href={explorerTxUrl(sig, settings.network)}
+                          target="_blank"
+                          rel="noreferrer"
+                          style={{
+                            textDecoration: "none",
+                            fontWeight: 950,
+                            color: textCol,
+                          }}
+                          title={sig}
+                        >
+                          {shortSig(sig)}
+                        </a>
 
-                    {saveMsg && <div style={{ marginTop: 10, fontSize: 13 }}>{saveMsg}</div>}
-                  </>
+                        <div style={{ fontWeight: 950, color: labelColor(m.label) }}>
+                          {m.label}
+                        </div>
+
+                        <div style={{ fontSize: 13, color: subtleCol }}>
+                          {clamp(m.note ?? "", 120)}
+                          {m.proofUrl ? (
+                            <>
+                              {" "}
+                              ·{" "}
+                              <a
+                                href={m.proofUrl}
+                                target="_blank"
+                                rel="noreferrer"
+                                style={{
+                                  color: textCol,
+                                  fontWeight: 900,
+                                  textDecoration: "none",
+                                }}
+                              >
+                                link →
+                              </a>
+                            </>
+                          ) : null}
+                        </div>
+
+                        {!isPublicView ? (
+                          <button
+                            onClick={() => {
+                              setView("dashboard");
+                              setSelectedSig(sig);
+                              setTimeout(scrollToEditor, 60);
+                            }}
+                            style={{
+                              padding: "10px 10px",
+                              borderRadius: 14,
+                              border: `1px solid ${borderCol}`,
+                              background: "rgba(255,255,255,0.08)",
+                              color: textCol,
+                              fontWeight: 950,
+                              cursor: "pointer",
+                            }}
+                            title="Edit this entry"
+                          >
+                            edit
+                          </button>
+                        ) : (
+                          <span />
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 )}
               </div>
             </div>
           )}
-        </div>
-      )}
 
-      {/* Ledger Tab */}
-      {tab === "Treasury Ledger" && (
-        <div style={{ marginTop: 18, border: "1px solid rgba(0,0,0,0.12)", borderRadius: 12, padding: 12 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
-            <div style={{ fontSize: 16, fontWeight: 900 }}>Treasury Ledger</div>
-            <input
-              value={searchLedger}
-              onChange={(e) => setSearchLedger(e.target.value)}
-              placeholder="Search by signature, category, description…"
+          {!isPublicView && view === "proof" && (
+            <div
               style={{
-                padding: "10px 12px",
-                borderRadius: 10,
-                border: "1px solid rgba(0,0,0,0.18)",
-                outline: "none",
-                minWidth: 280,
+                borderRadius: 18,
+                border: `1px solid ${borderCol}`,
+                background: cardBg,
+                padding: 14,
+                backdropFilter: "blur(10px)",
               }}
-            />
-          </div>
+            >
+              <div
+                style={{
+                  display: "flex",
+                  justifyContent: "space-between",
+                  gap: 10,
+                  flexWrap: "wrap",
+                  alignItems: "center",
+                }}
+              >
+                <div>
+                  <div style={{ fontWeight: 950, fontSize: 14 }}>Protocol Proof</div>
+                  <div style={{ fontSize: 12, color: subtleCol }}>
+                    OTMS JSON → SHA-256 hash → anchor hash on-chain (Memo).
+                  </div>
+                </div>
 
-          <div style={{ marginTop: 12 }}>
-            {ledgerRows.length === 0 ? (
-              <div style={{ opacity: 0.75 }}>No ledger entries found.</div>
-            ) : (
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {ledgerRows.slice(0, 250).map(([sig, m]) => (
-                  <div
-                    key={sig}
-                    style={{
-                      display: "flex",
-                      justifyContent: "space-between",
-                      gap: 10,
-                      alignItems: "center",
-                      paddingTop: 10,
-                      borderTop: "1px solid rgba(0,0,0,0.06)",
-                    }}
+                {/* ICON ACTIONS (same size tiles) */}
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
+                  <ToolIconButton label="Connect wallet" onClick={connectWallet}>
+                    <Icons.Wallet />
+                  </ToolIconButton>
+
+                  <ToolIconButton
+                    label="Use wallet as treasury"
+                    onClick={useWalletAsTreasury}
+                    disabled={!walletAddress}
                   >
+                    <Icons.Link />
+                  </ToolIconButton>
+
+                  <ToolIconButton label="Generate proof hash" onClick={generateProof}>
+                    <Icons.Hash />
+                  </ToolIconButton>
+
+                  <ToolIconButton
+                    label="Anchor memo on-chain"
+                    onClick={anchorProofOnChain}
+                    disabled={!proofHash}
+                  >
+                    <Icons.Anchor />
+                  </ToolIconButton>
+                </div>
+              </div>
+
+              <div style={{ marginTop: 12, color: subtleCol, fontSize: 13 }}>
+                Wallet:{" "}
+                <b style={{ color: textCol }}>
+                  {walletAddress
+                    ? `${walletAddress.slice(0, 4)}…${walletAddress.slice(-4)}`
+                    : "not connected"}
+                </b>
+              </div>
+
+              <div style={{ marginTop: 10 }}>
+                <div style={{ fontSize: 12, color: subtleCol }}>Current Proof Hash</div>
+                <div
+                  style={{
+                    fontFamily: "ui-monospace, Menlo, monospace",
+                    wordBreak: "break-all",
+                    fontWeight: 900,
+                  }}
+                >
+                  {proofHash || "—"}
+                </div>
+
+                {proofTxSig && (
+                  <div style={{ marginTop: 8 }}>
+                    Anchored Tx:{" "}
                     <a
-                      href={`https://explorer.solana.com/tx/${sig}?cluster=devnet`}
+                      href={explorerTxUrl(proofTxSig, settings.network)}
                       target="_blank"
                       rel="noreferrer"
-                      style={{ textDecoration: "none", fontWeight: 900 }}
-                      title={sig}
+                      style={{
+                        color: textCol,
+                        fontWeight: 950,
+                        textDecoration: "none",
+                      }}
                     >
-                      {shortSig(sig)}
+                      {shortSig(proofTxSig)} →
                     </a>
+                  </div>
+                )}
 
-                    <div style={{ fontWeight: 900, color: labelColor(m.label) }}>{m.label}</div>
+                {proofMsg && <div style={{ marginTop: 8, color: subtleCol }}>{proofMsg}</div>}
 
-                    <div style={{ flex: 1, fontSize: 13, opacity: 0.9 }}>{m.note ?? ""}</div>
+                {proofJson && (
+                  <details style={{ marginTop: 12 }}>
+                    <summary style={{ cursor: "pointer", fontWeight: 950 }}>
+                      View OTMS JSON (Proof Payload)
+                    </summary>
+                    <pre
+                      style={{
+                        marginTop: 10,
+                        padding: 12,
+                        borderRadius: 16,
+                        border: `1px solid ${borderCol}`,
+                        background:
+                          settings.theme === "dark"
+                            ? "rgba(0,0,0,0.25)"
+                            : "rgba(255,255,255,0.7)",
+                        overflowX: "auto",
+                        fontSize: 12,
+                        color: textCol,
+                      }}
+                    >
+                      {proofJson}
+                    </pre>
+                  </details>
+                )}
+              </div>
+            </div>
+          )}
 
-                    <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-                      {m.proofUrl && (
-                        <a href={m.proofUrl} target="_blank" rel="noreferrer" style={{ textDecoration: "none" }}>
-                          link
-                        </a>
-                      )}
+          {!isPublicView && view === "verify" && (
+            <div
+              style={{
+                borderRadius: 18,
+                border: `1px solid ${borderCol}`,
+                background: cardBg,
+                padding: 14,
+                backdropFilter: "blur(10px)",
+              }}
+            >
+              <div style={{ fontWeight: 950, fontSize: 14 }}>Proof Verification</div>
+              <div style={{ fontSize: 12, color: subtleCol, marginTop: 4 }}>
+                Paste tx signature + OTMS JSON, then verify the hash matches the on-chain Memo.
+              </div>
 
-                      {!isPublicView && (
-                        <button
-                          onClick={() => selectTx(sig, { goEditor: true })}
-                          style={{
-                            padding: "8px 10px",
-                            borderRadius: 10,
-                            border: "1px solid rgba(0,0,0,0.15)",
-                            background: "#111",
-                            color: "white",
-                            fontWeight: 900,
-                            cursor: "pointer",
-                          }}
-                        >
-                          edit
-                        </button>
-                      )}
+              <div style={{ marginTop: 12, display: "grid", gap: 10 }}>
+                <input
+                  value={verifyTx}
+                  onChange={(e) => setVerifyTx(e.target.value)}
+                  placeholder={`Paste ${settings.network} tx signature here…`}
+                  style={{
+                    width: "100%",
+                    padding: "12px 12px",
+                    borderRadius: 14,
+                    border: `1px solid ${borderCol}`,
+                    outline: "none",
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.25)"
+                        : "rgba(255,255,255,0.7)",
+                    color: textCol,
+                    fontSize: 13,
+                  }}
+                />
+
+                <textarea
+                  value={verifyJson}
+                  onChange={(e) => setVerifyJson(e.target.value)}
+                  placeholder="Paste OTMS JSON here…"
+                  rows={9}
+                  style={{
+                    width: "100%",
+                    padding: "12px 12px",
+                    borderRadius: 14,
+                    border: `1px solid ${borderCol}`,
+                    outline: "none",
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.25)"
+                        : "rgba(255,255,255,0.7)",
+                    color: textCol,
+                    fontFamily: "ui-monospace, Menlo, monospace",
+                    fontSize: 12,
+                  }}
+                />
+
+                <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                  <button
+                    onClick={verifyProof}
+                    style={{
+                      padding: "10px 12px",
+                      borderRadius: 14,
+                      border: `1px solid ${borderCol}`,
+                      background: "rgba(255,255,255,0.12)",
+                      color: textCol,
+                      fontWeight: 950,
+                      cursor: "pointer",
+                    }}
+                  >
+                    Verify Proof
+                  </button>
+
+                  {verifyTx.trim() && (
+                    <a
+                      href={explorerTxUrl(verifyTx.trim(), settings.network)}
+                      target="_blank"
+                      rel="noreferrer"
+                      style={{ color: textCol, fontWeight: 950, textDecoration: "none" }}
+                    >
+                      Open Tx in Explorer →
+                    </a>
+                  )}
+                </div>
+
+                {verifyMsg && (
+                  <pre
+                    style={{
+                      marginTop: 6,
+                      padding: 12,
+                      borderRadius: 16,
+                      border: `1px solid ${borderCol}`,
+                      background:
+                        settings.theme === "dark"
+                          ? "rgba(0,0,0,0.25)"
+                          : "rgba(255,255,255,0.7)",
+                      whiteSpace: "pre-wrap",
+                      color: textCol,
+                      fontSize: 12,
+                    }}
+                  >
+                    {verifyMsg}
+                  </pre>
+                )}
+              </div>
+            </div>
+          )}
+
+          {!isPublicView && view === "settings" && (
+            <div
+              style={{
+                borderRadius: 18,
+                border: `1px solid ${borderCol}`,
+                background: cardBg,
+                padding: 14,
+                backdropFilter: "blur(10px)",
+              }}
+            >
+              <div style={{ fontWeight: 950, fontSize: 14 }}>System Settings</div>
+              <div style={{ fontSize: 12, color: subtleCol, marginTop: 4 }}>
+                Local settings (stored in your browser for this MVP).
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14, marginTop: 12 }}>
+                {/* General */}
+                <div
+                  style={{
+                    borderRadius: 16,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.20)"
+                        : "rgba(255,255,255,0.6)",
+                    padding: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 950 }}>General</div>
+
+                  <label style={{ display: "block", marginTop: 10, fontSize: 12, color: subtleCol }}>
+                    Language
+                  </label>
+                  <select
+                    value={settings.language}
+                    onChange={(e) => setSettings((s) => ({ ...s, language: e.target.value as Language }))
+                    }
+                    style={{
+                      width: "100%",
+                      padding: "10px 12px",
+                      marginTop: 6,
+                      borderRadius: 14,
+                      border: `1px solid ${borderCol}`,
+                      background:
+                        settings.theme === "dark"
+                          ? "rgba(0,0,0,0.25)"
+                          : "rgba(255,255,255,0.85)",
+                      color: textCol,
+                      outline: "none",
+                      fontWeight: 900,
+                    }}
+                  >
+                    {LANGUAGE_OPTIONS.map((x) => (
+                      <option key={x} value={x}>
+                        {x}
+                      </option>
+                    ))}
+                  </select>
+
+                  <label style={{ display: "block", marginTop: 10, fontSize: 12, color: subtleCol }}>
+                    Currency
+                  </label>
+                  <select
+                    value={settings.currency}
+                    onChange={(e) =>
+                      setSettings((s) => ({ ...s, currency: e.target.value as Currency }))
+                    }
+                    style={{
+                      width: "100%",
+                      padding: "10px 12px",
+                      marginTop: 6,
+                      borderRadius: 14,
+                      border: `1px solid ${borderCol}`,
+                      background:
+                        settings.theme === "dark"
+                          ? "rgba(0,0,0,0.25)"
+                          : "rgba(255,255,255,0.85)",
+                      color: textCol,
+                      outline: "none",
+                      fontWeight: 900,
+                    }}
+                  >
+                    {CURRENCY_OPTIONS.map((x) => (
+                      <option key={x} value={x}>
+                        {x}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Network */}
+                <div
+                  style={{
+                    borderRadius: 16,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.20)"
+                        : "rgba(255,255,255,0.6)",
+                    padding: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 950 }}>Network</div>
+
+                  <label style={{ display: "block", marginTop: 10, fontSize: 12, color: subtleCol }}>
+                    Solana Cluster
+                  </label>
+                  <select
+                    value={settings.network}
+                    onChange={(e) =>
+                      setSettings((s) => ({ ...s, network: e.target.value as ClusterKey }))
+                    }
+                    style={{
+                      width: "100%",
+                      padding: "10px 12px",
+                      marginTop: 6,
+                      borderRadius: 14,
+                      border: `1px solid ${borderCol}`,
+                      background:
+                        settings.theme === "dark"
+                          ? "rgba(0,0,0,0.25)"
+                          : "rgba(255,255,255,0.85)",
+                      color: textCol,
+                      outline: "none",
+                      fontWeight: 900,
+                    }}
+                  >
+                    <option value="mainnet-beta">mainnet-beta</option>
+                    <option value="testnet">testnet</option>
+                    <option value="devnet">devnet</option>
+                  </select>
+
+                  <div style={{ marginTop: 10, fontSize: 12, color: subtleCol }}>
+                    Changing network changes RPC + explorer links + stored ledger bucket.
+                  </div>
+                </div>
+
+                {/* Privacy */}
+                <div
+                  style={{
+                    borderRadius: 16,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.20)"
+                        : "rgba(255,255,255,0.6)",
+                    padding: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 950 }}>Security & Privacy</div>
+
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 12 }}>
+                    <div>
+                      <div style={{ fontWeight: 900 }}>Hide balance</div>
+                      <div style={{ fontSize: 12, color: subtleCol }}>
+                        Hides balance value in the header (local-only).
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => setSettings((s) => ({ ...s, hideBalance: !s.hideBalance }))}
+                      style={{
+                        width: 54,
+                        height: 34,
+                        borderRadius: 999,
+                        border: `1px solid ${borderCol}`,
+                        background: settings.hideBalance
+                          ? "rgba(52,211,153,0.25)"
+                          : "rgba(255,255,255,0.06)",
+                        position: "relative",
+                        cursor: "pointer",
+                      }}
+                      title="Toggle hide balance"
+                    >
+                      <span
+                        style={{
+                          width: 26,
+                          height: 26,
+                          borderRadius: 999,
+                          background: settings.theme === "dark" ? "#e5e7eb" : "#0b1220",
+                          position: "absolute",
+                          top: 3,
+                          left: settings.hideBalance ? 26 : 3,
+                          transition: "left .15s ease",
+                        }}
+                      />
+                    </button>
+                  </div>
+
+                  <div style={{ marginTop: 14, paddingTop: 12, borderTop: `1px solid ${borderCol}` }}>
+                    <div style={{ fontWeight: 900 }}>Auth (MVP placeholder)</div>
+                    <div style={{ fontSize: 12, color: subtleCol, marginTop: 6 }}>
+                      Registration/Login/Change password requires backend. We keep UI placeholders for now.
                     </div>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
+                </div>
 
-          <div style={{ marginTop: 10, fontSize: 12, opacity: 0.75 }}>
-            {isPublicView ? "Public view is read-only." : "Tip: Click “edit” to jump back into the editor."}
-          </div>
+                {/* Theme */}
+                <div
+                  style={{
+                    borderRadius: 16,
+                    border: `1px solid ${borderCol}`,
+                    background:
+                      settings.theme === "dark"
+                        ? "rgba(0,0,0,0.20)"
+                        : "rgba(255,255,255,0.6)",
+                    padding: 12,
+                  }}
+                >
+                  <div style={{ fontWeight: 950 }}>Appearance</div>
+
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <button
+                      onClick={() => setSettings((s) => ({ ...s, theme: "light" }))}
+                      style={{
+                        flex: 1,
+                        padding: "10px 12px",
+                        borderRadius: 14,
+                        border: `1px solid ${borderCol}`,
+                        background: settings.theme === "light" ? "rgba(255,255,255,0.85)" : "transparent",
+                        color: textCol,
+                        fontWeight: 950,
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: 8,
+                      }}
+                      title="Light Mode"
+                    >
+                      <Icons.Sun /> Light
+                    </button>
+
+                    <button
+                      onClick={() => setSettings((s) => ({ ...s, theme: "dark" }))}
+                      style={{
+                        flex: 1,
+                        padding: "10px 12px",
+                        borderRadius: 14,
+                        border: `1px solid ${borderCol}`,
+                        background: settings.theme === "dark" ? "rgba(255,255,255,0.10)" : "transparent",
+                        color: textCol,
+                        fontWeight: 950,
+                        cursor: "pointer",
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "center",
+                        gap: 8,
+                      }}
+                      title="Dark Mode"
+                    >
+                      <Icons.Moon /> Dark
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {isPublicView && (
+            <div
+              style={{
+                borderRadius: 18,
+                border: `1px solid ${borderCol}`,
+                background: cardBg,
+                padding: 14,
+                backdropFilter: "blur(10px)",
+              }}
+            >
+              <div style={{ fontWeight: 950, fontSize: 14 }}>Public View</div>
+              <div style={{ fontSize: 12, color: subtleCol, marginTop: 6 }}>
+                This view is read-only. Share it publicly.
+              </div>
+              <div style={{ marginTop: 10, fontSize: 12, color: subtleCol }}>
+                Tip: remove <b>?view=public</b> to return to the private admin view.
+              </div>
+            </div>
+          )}
         </div>
-      )}
+      </div>
     </div>
   );
 }
